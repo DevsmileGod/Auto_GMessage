@@ -1,0 +1,4 @@
+
+# Ignore credentials containing sensitive keys
+credentials.json
+token.json

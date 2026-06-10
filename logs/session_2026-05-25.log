@@ -1,0 +1,315 @@
+Starting send to 1 recipient(s)...
+Stop requested — finishing current email...
+Paused at 0/1.
+Sending resumed.
+Stop requested — finishing current email...
+Stop requested — finishing current email...
+Paused at 0/1.
+Sending resumed.
+Paused at 0/1.
+Stop requested — finishing current email...
+Stop requested — finishing current email...
+Stop requested — finishing current email...
+Stop requested — finishing current email...
+Starting send to 1 recipient(s)...
+Send interval updated to 5s.
+Starting send to 1 recipient(s)...
+Gmail sign-in started — complete login in your browser.
+Gmail sign-in started — complete login in your browser.
+Gmail sign-in failed: Gmail sign-in timed out.
+
+1. Click the URL printed in the terminal (or PowerShell window)
+2. Sign in with your Google account
+3. Click Allow / Continue
+4. Wait until the browser shows success, then try Send again
+
+Also check: your Gmail is added as a Test user on the Google OAuth consent screen.
+Gmail sign-in started — complete login in your browser.
+Gmail sign-in successful.
+Send interval updated to 10s.
+Removed 2 duplicate address(es).
+Starting send to 2 recipient(s)...
+✅ Sent to m.djurdjevic0202@gmail.com — 08:09:10
+✅ Sent to elenaoliver@gmail.com — 08:09:11
+Sending complete.
+Starting send to 2 recipient(s)...
+✅ Sent to m.djurdjevic0202@gmail.com — 08:10:08
+✅ Sent to elenaoliver@gmail.com — 08:10:08
+Sending complete.
+Starting send to 2 recipient(s)...
+✅ Sent to m.djurdjevic0202@gmail.com — 08:11:29
+✅ Sent to elenaoliver@gmail.com — 08:11:30
+Sending complete.
+Starting send to 2 recipient(s)...
+✅ Sent to m.djurdjevic0202@gmail.com — 08:12:31
+✅ Sent to elenaoliver@gmail.com — 08:12:31
+Sending complete.
+Starting send to 1 recipient(s)...
+✅ Sent to elenaoliver@gmail.com — 08:14:07
+Sending complete.
+Gmail sign-in started — complete login in your browser.
+Gmail sign-in successful.
+Gmail sign-in started — complete login in your browser.
+Gmail sign-in successful.
+Signed out of Gmail. Sign in with your other account.
+Gmail sign-in started — complete login in your browser.
+Signed out of Gmail. Sign in with your other account.
+Gmail sign-in started — complete login in your browser.
+Signed out of Gmail. Sign in with your other account.
+Gmail sign-in started — complete login in your browser.
+Gmail sign-in started — complete login in your browser.
+Gmail sign-in started — complete login in your browser.
+Gmail sign-in failed: Gmail sign-in timed out.
+
+1. Click the URL printed in the terminal (or PowerShell window)
+2. Sign in with your Google account
+3. Click Allow / Continue
+4. Wait until the browser shows success, then try Send again
+
+Also check: your Gmail is added as a Test user on the Google OAuth consent screen.
+Gmail sign-in started — complete login in your browser.
+Gmail sign-in failed: Gmail sign-in timed out.
+
+1. Click the URL printed in the terminal (or PowerShell window)
+2. Sign in with your Google account
+3. Click Allow / Continue
+4. Wait until the browser shows success, then try Send again
+
+Also check: your Gmail is added as a Test user on the Google OAuth consent screen.
+Gmail sign-in started — complete login in your browser.
+Gmail sign-in successful.
+Gmail sign-in started — complete login in your browser.
+Gmail sign-in successful.
+Template saved: "coll_1"
+Imported 102 recipient(s).
+Send interval updated to 120s.
+Starting send to 102 recipient(s)...
+❌ Failed: hi@aaronhktan.com — 08:51:28
+✅ Sent to bert@somethingdoneright.net — 08:51:58
+✅ Sent to me@russellbradley.com — 08:52:07
+✅ Sent to lukewhrit@pm.me — 08:52:19
+✅ Sent to frank@frankcaron.com — 08:52:24
+✅ Sent to lucianjones96@gmail.com — 08:52:27
+Stop requested — finishing current email...
+✅ Sent to sean.stewart@hey.com — 08:52:34
+Sending stopped by user.
+Template loaded: "coll_1"
+Imported 102 recipient(s).
+Starting send to 102 recipient(s)...
+✅ Sent to hi@aaronhktan.com — 08:58:55
+✅ Sent to bert@somethingdoneright.net — 09:00:56
+✅ Sent to me@russellbradley.com — 09:02:57
+✅ Sent to lukewhrit@pm.me — 09:04:59
+✅ Sent to frank@frankcaron.com — 09:06:59
+✅ Sent to lucianjones96@gmail.com — 09:09:00
+✅ Sent to sean.stewart@hey.com — 09:11:01
+✅ Sent to goldstein@nyu.edu — 09:13:02
+✅ Sent to julienfantin@gmail.com — 09:15:04
+✅ Sent to edwinthinks@gmail.com — 09:17:05
+✅ Sent to abart97@hotmail.it — 09:19:06
+✅ Sent to github@tlima.me — 09:21:07
+✅ Sent to realjoelrivera@gmail.com — 09:23:09
+✅ Sent to evan@esobko.com — 09:25:10
+✅ Sent to sslyu@cs.washington.edu — 09:27:11
+✅ Sent to github@masonx.ca — 09:29:14
+✅ Sent to ho.kevins@gmail.com — 09:31:15
+Stop requested — finishing current email...
+Sending stopped by user.
+Signed out of Gmail. Sign in with your other account.
+Gmail sign-in started — complete login in your browser.
+Gmail sign-in failed: Gmail sign-in timed out.
+
+1. Click the URL printed in the terminal (or PowerShell window)
+2. Sign in with your Google account
+3. Click Allow / Continue
+4. Wait until the browser shows success, then try Send again
+
+Also check: your Gmail is added as a Test user on the Google OAuth consent screen.
+Gmail sign-in started — complete login in your browser.
+Gmail sign-in failed: Gmail sign-in timed out.
+
+1. Click the URL printed in the terminal (or PowerShell window)
+2. Sign in with your Google account
+3. Click Allow / Continue
+4. Wait until the browser shows success, then try Send again
+
+Also check: your Gmail is added as a Test user on the Google OAuth consent screen.
+Gmail sign-in started — complete login in your browser.
+Gmail sign-in successful.
+Starting send to 102 recipient(s)...
+✅ Sent to hi@aaronhktan.com — 09:40:38
+Stop requested — finishing current email...
+Sending stopped by user.
+Gmail sign-in started — complete login in your browser.
+Gmail sign-in successful.
+Template loaded: "coll_1"
+Imported 102 recipient(s).
+Deleted 19 recipient(s).
+Starting send to 83 recipient(s)...
+✅ Sent to shah.mansi246@gmail.com — 09:49:50
+✅ Sent to pierre.klein@mail.mcgill.ca — 09:51:51
+✅ Sent to sarahconfrancisco@gmail.com — 09:53:52
+✅ Sent to jonathan5kyl@gmail.com — 09:55:53
+✅ Sent to rellas.email@gmail.com — 09:57:54
+✅ Sent to Dante82639@gmail.com — 09:59:55
+✅ Sent to ted@patinaproject.com — 10:01:55
+✅ Sent to zach@lysobey.com — 10:03:56
+✅ Sent to robin.schmidt.97@web.de — 10:05:57
+✅ Sent to j.jantschulev@gmail.com — 10:07:58
+✅ Sent to haoyu.li@columbia.edu — 10:09:59
+✅ Sent to svapnila@gmail.com — 10:12:00
+✅ Sent to crm2193@columbia.edu — 10:14:01
+✅ Sent to devinjstarks@gmail.com — 10:16:02
+✅ Sent to moktarjama@gmail.com — 10:18:06
+✅ Sent to briankn8@gmail.com — 10:20:07
+✅ Sent to max.currier1@gmail.com — 10:22:08
+✅ Sent to maverick.alzate@gmail.com — 10:24:09
+✅ Sent to zhangzhida822@outlook.com — 10:26:10
+✅ Sent to eugene.wang@flatironschool.com — 10:28:11
+✅ Sent to gordon.le11@gmail.com — 10:30:12
+✅ Sent to alex.betts@gmail.com — 10:32:13
+✅ Sent to thesolitaryecrivain@gmail.com — 10:34:14
+✅ Sent to karl.kwon.phd@gmail.com — 10:36:15
+✅ Sent to evan108108@gmail.com — 10:38:17
+✅ Sent to wmacura@gmail.com — 10:40:18
+✅ Sent to austenpayan@gmail.com — 10:42:19
+✅ Sent to wz1232@nyu.edu — 10:44:20
+✅ Sent to lceames@gmail.com — 10:46:21
+✅ Sent to samsikabir@gmail.com — 10:48:21
+✅ Sent to tavi.nathanson@gmail.com — 10:50:22
+✅ Sent to ezwang1@gmail.com — 10:52:24
+✅ Sent to hemanthmalla@gmail.com — 10:54:24
+✅ Sent to sheldon.thomas@me.com — 10:56:25
+✅ Sent to andrew.gk.yuan@gmail.com — 10:58:26
+✅ Sent to twinklemehta8@gmail.com — 11:00:26
+✅ Sent to harryh@gmail.com — 11:02:27
+✅ Sent to mickeydang7299@gmail.com — 11:04:28
+✅ Sent to github@codebrewstudios.com — 11:06:28
+✅ Sent to hello@vndrewlee.com — 11:08:29
+✅ Sent to jhadfield129@gmail.com — 11:10:30
+✅ Sent to gaddog94@gmail.com — 11:12:31
+✅ Sent to theo@theolinnemann.com — 11:14:31
+✅ Sent to subashree188@gmail.com — 11:16:32
+✅ Sent to aaronvasquez1@gmail.com — 11:18:33
+✅ Sent to chenmx00@yahoo.com — 11:20:33
+✅ Sent to luis@quezada.nl — 11:22:34
+✅ Sent to gregory.mazurek@gmail.com — 11:24:35
+✅ Sent to james.liounis@perplexity.ai — 11:26:36
+✅ Sent to jason@remo.health — 11:28:37
+✅ Sent to svitali@seas.upenn.edu — 11:30:37
+✅ Sent to jaimildalwadi2003@gmail.com — 11:32:38
+✅ Sent to ruhua.jiang@gmail.com — 11:34:40
+✅ Sent to david.chen.dc2546@yale.edu — 11:36:41
+✅ Sent to nsakhilesh02@gmail.com — 11:38:42
+✅ Sent to tammytan1912@gmail.com — 11:40:43
+✅ Sent to me@alexwendland.com — 11:42:43
+✅ Sent to jpnorair@indigresso.com — 11:44:44
+✅ Sent to ZacharySmith4989@gmail.com — 11:46:45
+✅ Sent to chenxi@cs.columbia.edu — 11:48:45
+✅ Sent to jay.kaye31@gmail.com — 11:50:46
+✅ Sent to rainrues@gmail.com — 11:52:47
+✅ Sent to jacob@jacobsandlund.com — 11:54:49
+✅ Sent to cvh255@nyu.edu — 11:56:49
+✅ Sent to lee@felar.ca — 11:58:50
+✅ Sent to jhwilner1@gmail.com — 12:00:51
+✅ Sent to gigimscarborough@gmail.com — 12:02:52
+✅ Sent to joe@joeconyers.com — 12:04:53
+✅ Sent to daniel.s.catalano@gmail.com — 12:06:54
+✅ Sent to rebeccaweir12@gmail.com — 12:08:55
+✅ Sent to hi@peterlin.ca — 12:10:55
+✅ Sent to benkbaron@gmail.com — 12:12:56
+✅ Sent to anas.stathop@gmail.com — 12:14:57
+✅ Sent to michael.perlin@jpmchase.com — 12:16:58
+✅ Sent to daan@devign.it — 12:18:59
+✅ Sent to anubhabr50@gmail.com — 12:21:00
+✅ Sent to gagejustins@gmail.com — 12:23:01
+✅ Sent to brurua@gmail.com — 12:25:02
+✅ Sent to machekhinn@gmail.com — 12:27:03
+✅ Sent to rhieger@gmail.com — 12:29:03
+✅ Sent to settnaing199@gmail.com — 12:31:06
+✅ Sent to cassiemoy@positiondev.com — 12:33:07
+✅ Sent to cttsai.git@outlook.com — 12:35:07
+Sending complete.
+Deleted 83 recipient(s).
+Imported 385 recipient(s).
+Send interval updated to 600s.
+Starting send to 385 recipient(s)...
+✅ Sent to echo@echonolan.net — 12:42:37
+✅ Sent to sarahsaltrick@gmail.com — 12:52:39
+✅ Sent to georgeliu96@gmail.com — 13:02:41
+✅ Sent to jeff@unbuggy.com — 13:12:43
+✅ Sent to rosendopili@gmail.com — 13:22:44
+✅ Sent to jpmcgaw@gmail.com — 13:32:48
+✅ Sent to simon.wong@uwaterloo.ca — 13:42:50
+✅ Sent to eytan85@gmail.com — 13:52:52
+✅ Sent to buckeye01@hotmail.com — 14:02:54
+✅ Sent to dchassin@eudoxys.com — 14:12:56
+✅ Sent to multimegamander@gmail.com — 14:22:58
+✅ Sent to rdm@cfcl.com — 14:33:01
+✅ Sent to kaminskikeving@gmail.com — 14:43:02
+✅ Sent to thomasjoyce@gmail.com — 14:53:04
+✅ Sent to jon.siebert@gmail.com — 15:03:03
+✅ Sent to tpollyblank16@gmail.com — 15:13:05
+Gmail sign-in started — complete login in your browser.
+Gmail sign-in successful.
+Imported 394 recipient(s).
+Starting send to 394 recipient(s)...
+✅ Sent to jon.siebert@gmail.com — 15:26:09
+✅ Sent to tpollyblank16@gmail.com — 15:36:11
+✅ Sent to jeff.d.calderon@gmail.com — 15:46:12
+✅ Sent to ttimz1313@gmail.com — 15:56:14
+❌ Failed: luked@pobox.com — 16:06:14
+✅ Sent to 1725364@mukilteo.wednet.edu — 16:16:16
+Stop requested — finishing current email...
+Sending stopped by user.
+Deleted 6 recipient(s).
+Template loaded: "coll_1"
+Starting send to 388 recipient(s)...
+✅ Sent to mikec@compasstechintl.com — 16:24:26
+✅ Sent to richard.mark.butler@gmail.com — 16:34:28
+❌ Failed: Eric_Brooke@Znazzyilluzionz.com — 16:44:50
+✅ Sent to lmariemeehan@gmail.com — 16:54:51
+❌ Failed: bergjeremy37@google.com — 17:04:51
+✅ Sent to feisty_rae@yahoo.com — 17:14:52
+❌ Failed: plptreeservicemarysvilleask@gmail.com — 17:24:52
+❌ Failed: bfe520jst@yahoo.com — 17:34:53
+✅ Sent to jeremi@jeremiross.com — 17:44:54
+❌ Failed: minhdan97@aol.com — 17:54:54
+Paused at 10/388.
+Sending resumed.
+✅ Sent to paige_brockway@na.honda.com — 18:04:57
+✅ Sent to LesleyPhillips@Yahoo.com — 18:14:59
+✅ Sent to ucrobots@gmail.com — 18:25:02
+❌ Failed: crtcreative@gmail.com — 18:35:02
+✅ Sent to ericdsergio87@icloud.com — 18:45:05
+✅ Sent to p4uaugust@gmail.com — 18:55:08
+✅ Sent to sean.meyer@nice.com — 19:05:10
+✅ Sent to marioserafini28@gmail.com — 19:15:12
+✅ Sent to robfendi48@gmail.com — 19:25:14
+✅ Sent to farmmechanic71@gmail.com — 19:35:16
+✅ Sent to sch20lboy562@gmail.com — 19:45:20
+✅ Sent to jdcalderon@students.everettcc.edu — 19:55:22
+✅ Sent to uzquiano@gmail.com — 20:05:24
+✅ Sent to joshbutkovic@gmail.com — 20:15:26
+✅ Sent to support@bastillion.io — 20:25:28
+✅ Sent to cjdierkens@gmail.com — 20:35:30
+✅ Sent to droodoyle89@gmail.com — 20:45:34
+✅ Sent to john@jtarthur.net — 20:55:36
+✅ Sent to HARLEYSTRICKLAND.2@GMAIL.COM — 21:05:38
+✅ Sent to wujiahui62@gmail.com — 21:15:41
+✅ Sent to info@govsoft.us — 21:25:43
+✅ Sent to erik.krevh@verizonconnect.com — 21:35:45
+✅ Sent to jminadeo@monkk.com — 21:45:49
+✅ Sent to joe@popolux.com — 21:55:51
+✅ Sent to rojendcruz10@gmail.com — 22:05:53
+✅ Sent to matthew.beargie@m.design — 22:15:55
+✅ Sent to caronrichard13@gmail.com — 22:25:57
+✅ Sent to proimageexpert@gmail.com — 22:35:59
+✅ Sent to nyrse335@gmail.com — 22:46:03
+✅ Sent to michael.snyder@mrisoftware.com — 22:56:05
+✅ Sent to jgoldstein@ggcomm.com — 23:06:08
+❌ Failed: rmcclellan@findawayworld.com — 23:16:08
+✅ Sent to wwewater90@gmail.com — 23:26:10
+✅ Sent to emena007@ucr.edu — 23:36:12
+❌ Failed: sdel030@ucr.edu — 23:46:12
+✅ Sent to clubowi2@asu.edu — 23:56:16

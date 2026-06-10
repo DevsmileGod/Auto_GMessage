@@ -1,0 +1,6 @@
+{
+  "interval_seconds": 600,
+  "theme": "light",
+  "default_subject": "Auto Message",
+  "default_body": "This is an automated message from Gmail Auto Sender."
+}
