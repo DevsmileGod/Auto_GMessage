@@ -1,3 +1,11 @@
+# 🚀 Auto_GMessage
+
+![GitHub stars](https://img.shields.io/github/stars/DevsmileGod/Auto_GMessage?style=social)
+![GitHub forks](https://img.shields.io/github/forks/DevsmileGod/Auto_GMessage?style=social)
+![GitHub last commit](https://img.shields.io/github/last-commit/DevsmileGod/Auto_GMessage)
+![GitHub repo size](https://img.shields.io/github/repo-size/DevsmileGod/Auto_GMessage)
+![License](https://img.shields.io/github/license/DevsmileGod/Auto_GMessage)
+
 # Gmail Auto Sender
 
 A desktop app that sends Gmail messages automatically on a fixed interval (default **30 seconds**). Built with Python, Tkinter, and the Gmail API.
