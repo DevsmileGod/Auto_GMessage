@@ -253,6 +253,29 @@ def test_failed_reply_keeps_recipient_awaiting(tmp_path, no_sleep):
     assert state.get(A).status == "Sent"  # never marked Done
 
 
+# --------------------------------------------------- concurrent follow-up
+
+
+def test_reply_is_answered_during_outreach_not_after(tmp_path):
+    """A reply to an early recipient goes out in the gap before the next send.
+
+    Real (unpatched) timing: with a 1s interval and fast polling, A's reply must
+    be sent before B's first message — proving the watcher runs concurrently.
+    """
+    store, state = setup(tmp_path, [A, B], ["M1", "M2"])
+    client = FakeGmailClient()
+    inbox = FakeInbox()
+    inbox.add_reply(A)
+    inbox.add_reply(B)
+    campaign = make(client, store, state, inbox, interval=1, poll=0.05)
+
+    run_campaign(campaign, Collector(), timeout=15)
+
+    sequence = [(r.kind, r.to) for r in client.records]
+    assert sequence.index(("reply", A)) < sequence.index(("first", B)), sequence
+    assert {r.to for r in client.replies()} == {A, B}
+
+
 # ------------------------------------------------------------ stop / state
 
 

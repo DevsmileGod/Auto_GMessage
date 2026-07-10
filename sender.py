@@ -1,16 +1,23 @@
 """Resumable campaign orchestration.
 
-Phase 1 — Outreach: walk the saved recipient queue from its cursor. Each recipient
-gets the next *available* first-message from the pool (a message under its 24h lock
-is unavailable). When the pool is momentarily exhausted the campaign parks and
-re-checks; because availability is derived from saved timestamps, a batch resumes
-on its own once 24h has elapsed — even if the app was closed the whole time.
+Two workers run concurrently on the campaign's lifetime:
 
-Phase 2 — Follow-up: throughout, poll the inbox and auto-send the single second
-message, as a threaded reply, to anyone who replies.
+- Outreach: walk the saved recipient queue from its cursor. Each recipient gets
+  the next *available* first-message from the pool (a message under its 24h lock
+  is unavailable). When the pool is momentarily exhausted, outreach parks and
+  re-checks; because availability is derived from saved timestamps, a batch
+  resumes on its own once 24h has elapsed — even if the app was closed.
 
-Every state change is persisted, so closing the laptop mid-campaign and reopening
-it later continues exactly where it left off.
+- Follow-up: poll the inbox continuously and, the moment a recipient replies,
+  send the single second message back as a threaded reply — without waiting for
+  outreach to finish. So a reply from recipient #5 is answered while recipient
+  #15 is still being contacted.
+
+The two workers share one SMTP connection and one state file, so SMTP sends are
+serialized under `_send_lock` and all state reads/writes under `_state_lock`; the
+two locks are never held at the same time. IMAP is touched only by the follow-up
+worker. Every state change is persisted, so closing the laptop mid-campaign and
+reopening later continues exactly where it left off.
 """
 
 import logging
@@ -109,7 +116,10 @@ class Campaign:
         self._stop_requested = False
         self._resume_event = threading.Event()
         self._resume_event.set()
-        self._thread: Optional[threading.Thread] = None
+        self._thread: Optional[threading.Thread] = None  # the manager thread
+        self._outreach_done = threading.Event()
+        self._send_lock = threading.Lock()   # serializes the shared SMTP connection
+        self._state_lock = threading.Lock()  # guards state reads/writes + its file
 
     # ------------------------------------------------------------ lifecycle
 
@@ -135,6 +145,7 @@ class Campaign:
         self.state.save()
         self._stop_requested = False
         self._resume_event.set()
+        self._outreach_done.clear()
         self._thread = threading.Thread(
             target=self._run, args=(callbacks or CampaignCallbacks(),), daemon=True
         )
@@ -172,85 +183,133 @@ class Campaign:
             time.sleep(min(1.0, remaining))
             remaining -= 1
 
+    # -------------------------------------------------- locked primitives
+
+    def _send_first(self, email: str, subject: str, body: str) -> SendResult:
+        with self._send_lock:
+            return self.client.send_email(email, subject, body, 1)
+
+    def _send_reply_locked(self, email, body, in_reply_to, references, subject) -> SendResult:
+        with self._send_lock:
+            return self.client.send_reply(
+                to=email, body=body, in_reply_to=in_reply_to,
+                references=references, subject=subject,
+            )
+
+    def _outreach_complete(self) -> bool:
+        with self._state_lock:
+            return self.state.outreach_complete()
+
     # ---------------------------------------------------------------- run
 
     def _run(self, cb: CampaignCallbacks) -> None:
-        try:
-            self._loop(cb)
-        finally:
-            cb._call("on_complete", self._stop_requested)
+        """Manager: run outreach and follow-up concurrently, then finalize once."""
+        outreach = threading.Thread(target=self._outreach_worker, args=(cb,), daemon=True)
+        watcher = threading.Thread(target=self._watcher_worker, args=(cb,), daemon=True)
+        outreach.start()
+        watcher.start()
 
-    def _loop(self, cb: CampaignCallbacks) -> None:
-        while not self._stop_requested:
+        outreach.join()
+        self._outreach_done.set()  # lets the watcher finish once no replies remain
+        watcher.join()
+
+        if not self._stop_requested:
+            with self._state_lock:
+                if self.state.is_finished():
+                    self.state.active = False
+                    self.state.save()
+        cb._call("on_complete", self._stop_requested)
+
+    # ------------------------------------------------------------- outreach
+
+    def _outreach_worker(self, cb: CampaignCallbacks) -> None:
+        """Contact recipients in batches, parking until the pool's locks expire."""
+        while not self._stop_requested and not self._outreach_complete():
             if not self._wait_until_resumed():
                 return
 
             self._outreach_batch(cb)
-            if self._stop_requested:
+
+            if self._stop_requested or self._outreach_complete():
                 return
 
-            self._poll_replies(cb)
-
-            if self.state.is_finished():
-                self.state.active = False
-                self.state.save()
-                return
-
-            # Not finished: either waiting for the next batch's locks to expire,
-            # and/or watching for replies. Either way, re-check after a poll.
-            if not self.state.outreach_complete():
-                wait = self.store.seconds_until_next_available()
-                if wait > 0:
-                    contacted = self.state.cursor
-                    cb._call("on_waiting", wait, contacted, len(self.state.recipients))
-
+            # Pool exhausted but recipients remain: report the wait and re-check
+            # after a poll interval (availability is timestamp-derived).
+            with self._state_lock:
+                contacted, total = self.state.cursor, len(self.state.recipients)
+            wait = self.store.seconds_until_next_available()
+            if wait > 0:
+                cb._call("on_waiting", wait, contacted, total)
             self._sleep(self.poll_interval_seconds)
 
     def _outreach_batch(self, cb: CampaignCallbacks) -> None:
         """Send first messages until the pool is exhausted or the queue is done."""
-        while not self._stop_requested and not self.state.outreach_complete():
+        while not self._stop_requested:
             if not self._wait_until_resumed():
                 return
 
             message = next(iter(self.store.available_first()), None)
             if message is None:
-                return  # pool exhausted for now — the loop will wait and retry
+                return  # pool exhausted for now
 
-            record = self.state.current()
+            with self._state_lock:
+                record = self.state.current()
             if record is None:
                 return
 
             cb._call("on_first_sending", record.email)
-            result = self.client.send_email(record.email, message.subject, message.body, 1)
+            result = self._send_first(record.email, message.subject, message.body)
 
-            if result.success:
-                message.mark_sent()
-                self.store.save()
-                self.state.mark_sent(
-                    record.email, result.message_id or "", message.subject, time.time()
-                )
-            else:
-                self.state.mark_failed(record.email)
+            with self._state_lock:
+                if result.success:
+                    message.mark_sent()
+                    self.store.save()
+                    self.state.mark_sent(
+                        record.email, result.message_id or "", message.subject, time.time()
+                    )
+                else:
+                    self.state.mark_failed(record.email)
+                self.state.advance_cursor()
+                cursor, total = self.state.cursor, len(self.state.recipients)
 
-            self.state.advance_cursor()
-            cb._call("on_first_result", result, self.state.cursor, len(self.state.recipients))
+            cb._call("on_first_result", result, cursor, total)
 
-            if self._stop_requested or self.state.outreach_complete():
+            if self._stop_requested or cursor >= total:
                 return
             # Pace within the batch only when another message is ready right now.
             if self.store.available_first():
                 self._sleep(self.interval_seconds)
 
+    # -------------------------------------------------------------- follow-up
+
+    def _watcher_worker(self, cb: CampaignCallbacks) -> None:
+        """Poll for replies and answer them, concurrently with outreach."""
+        while not self._stop_requested:
+            if not self._wait_until_resumed():
+                return
+
+            self._poll_replies(cb)
+
+            with self._state_lock:
+                nothing_pending = not self.state.pending_reply()
+            # Finish only once outreach is done AND everyone contacted has been
+            # answered; otherwise keep watching (more may become pending, or a
+            # reply may still arrive).
+            if self._outreach_done.is_set() and nothing_pending:
+                return
+            self._sleep(self.poll_interval_seconds)
+
     def _poll_replies(self, cb: CampaignCallbacks) -> None:
-        pending = self.state.pending_reply()
+        with self._state_lock:
+            pending = self.state.pending_reply()
+            answered = self.state.counts().get("Done", 0)
         if not pending:
             return
 
-        answered = self.state.counts().get("Done", 0)
         cb._call("on_phase_watch", len(pending), answered)
 
         try:
-            replies = self.inbox.find_replies(pending)
+            replies = self.inbox.find_replies(pending)  # network; never under a lock
         except Exception as exc:  # inbox trouble must not kill the campaign
             logger.warning("Reply check failed: %s", exc)
             return
@@ -262,17 +321,19 @@ class Campaign:
             self._handle_reply(reply, second_body, cb)
 
     def _handle_reply(self, reply: DetectedReply, second_body: str, cb: CampaignCallbacks) -> None:
-        record = self.state.get(reply.email)
-        if record is None or record.status not in ("Sent",):
-            return  # already answered, or never contacted
+        with self._state_lock:
+            record = self.state.get(reply.email)
+            if record is None or record.status != "Sent":
+                return  # already answered, or never contacted
+            email, subject_src = record.email, record.subject
 
-        cb._call("on_reply_detected", record.email)
-        subject = make_reply_subject(reply.reply_subject or record.subject)
+        cb._call("on_reply_detected", email)
+        subject = make_reply_subject(reply.reply_subject or subject_src)
         references = build_references(reply.reply_references, reply.reply_message_id)
-        result = self.client.send_reply(
-            to=record.email, body=second_body, in_reply_to=reply.reply_message_id,
-            references=references, subject=subject,
+        result = self._send_reply_locked(
+            email, second_body, reply.reply_message_id, references, subject
         )
         if result.success:
-            self.state.mark_done(record.email)
+            with self._state_lock:
+                self.state.mark_done(email)
         cb._call("on_second_result", result)
