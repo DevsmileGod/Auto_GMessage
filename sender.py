@@ -1,23 +1,35 @@
-"""Email sending logic."""
+"""Two-message-per-recipient sending loop."""
 
-import base64
 import logging
 import re
 import threading
 import time
 from dataclasses import dataclass
-from email.mime.text import MIMEText
-from typing import Callable
+from typing import Callable, Optional
 
-from googleapiclient.discovery import Resource
-
+from gmail_client import GmailClient, SendResult
 
 logger = logging.getLogger(__name__)
 
 SEND_INTERVAL_SECONDS = 30
 MAX_RETRY_ATTEMPTS = 3
-BACKOFF_BASE_SECONDS = 2
+MESSAGES_PER_RECIPIENT = 2
 EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+
+StatusCallback = Callable[[str, int], None]
+ResultCallback = Callable[[SendResult, int, int], None]
+CompleteCallback = Callable[[bool, list[SendResult], list[str]], None]
+
+
+@dataclass
+class Message:
+    """One of the two messages sent to every recipient."""
+
+    subject: str
+    body: str
+
+    def is_empty(self) -> bool:
+        return not self.subject.strip() or not self.body.strip()
 
 
 def deduplicate_emails(emails: list[str]) -> tuple[list[str], int]:
@@ -40,69 +52,51 @@ def deduplicate_emails(emails: list[str]) -> tuple[list[str], int]:
     return unique, duplicates_removed
 
 
-def validate_send_inputs(emails: list[str], subject: str, body: str) -> list[str]:
+def validate_send_inputs(emails: list[str], messages: list[Message]) -> list[str]:
     """Return validation error messages for a send request."""
     errors: list[str] = []
 
     if not emails:
         errors.append("Email list is empty.")
-    if not subject.strip():
-        errors.append("Subject is required.")
-    if not body.strip():
-        errors.append("Message body is empty.")
+
+    invalid = [e for e in emails if not EMAIL_PATTERN.match(e.strip())]
+    if invalid:
+        errors.append(f"Invalid address: {invalid[0]}")
+
+    if len(messages) != MESSAGES_PER_RECIPIENT:
+        errors.append(f"Exactly {MESSAGES_PER_RECIPIENT} messages are required.")
+
+    for index, message in enumerate(messages, start=1):
+        if not message.subject.strip():
+            errors.append(f"Message {index}: subject is required.")
+        if not message.body.strip():
+            errors.append(f"Message {index}: body is empty.")
 
     return errors
 
 
-@dataclass
-class SendResult:
-    """Outcome of a single email send attempt."""
-
-    email: str
-    success: bool
-    message_id: str | None = None
-    error: str | None = None
-    retry_attempt: int = 0
-
-
 class EmailSender:
-    """Sends emails via Gmail API on a background thread with a fixed interval."""
+    """Sends two messages to each recipient in turn, waiting `interval_seconds` between sends.
 
-    def __init__(self, interval_seconds: int = SEND_INTERVAL_SECONDS):
+    The order is: recipient A message 1, wait, recipient A message 2, wait,
+    recipient B message 1, wait, recipient B message 2, ... No wait after the
+    final message.
+
+    If a recipient's first message fails, the second is skipped — resending only
+    the failed message on retry is what keeps a retry from delivering message 1
+    twice.
+    """
+
+    def __init__(self, client: GmailClient, interval_seconds: int = SEND_INTERVAL_SECONDS):
+        self.client = client
         self.interval_seconds = interval_seconds
         self._stop_requested = False
         self._resume_event = threading.Event()
         self._resume_event.set()
-        self._thread: threading.Thread | None = None
+        self._thread: Optional[threading.Thread] = None
         self._retry_counts: dict[str, int] = {}
-        self._session_failed: list[str] = []
-
-    @staticmethod
-    def send_email(
-        service: Resource,
-        to: str,
-        subject: str,
-        body: str,
-        sender: str | None = None,
-    ) -> SendResult:
-        """Encode an RFC 2822 message as base64 and send via Gmail API."""
-        try:
-            message = MIMEText(body)
-            message["to"] = to
-            message["subject"] = subject
-            if sender:
-                message["from"] = sender
-
-            raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
-            payload = {"raw": raw}
-
-            result = service.users().messages().send(userId="me", body=payload).execute()
-            message_id = result.get("id")
-            logger.info("Email sent to %s (message id: %s)", to, message_id)
-            return SendResult(email=to, success=True, message_id=message_id)
-        except Exception as exc:
-            logger.error("Failed to send email to %s: %s", to, exc)
-            return SendResult(email=to, success=False, error=str(exc))
+        # email -> message indices (1-based) still owed to that recipient
+        self._pending: dict[str, list[int]] = {}
 
     @property
     def is_running(self) -> bool:
@@ -113,61 +107,59 @@ class EmailSender:
         return not self._resume_event.is_set()
 
     def reset_session(self) -> None:
-        """Clear failed-email tracking for a new send session."""
+        """Clear retry tracking for a new send session."""
         self._retry_counts.clear()
-        self._session_failed.clear()
+        self._pending.clear()
 
     def get_retryable_failed(self) -> list[str]:
-        """Return failed emails that still have retry attempts remaining."""
+        """Return recipients with undelivered messages and retry attempts remaining."""
         return [
             email
-            for email in dict.fromkeys(self._session_failed)
-            if self._retry_counts.get(email, 0) < MAX_RETRY_ATTEMPTS
+            for email, indices in self._pending.items()
+            if indices and self._retry_counts.get(email, 0) < MAX_RETRY_ATTEMPTS
         ]
+
+    def pending_messages(self, email: str) -> list[int]:
+        """Message indices still owed to a recipient."""
+        return list(self._pending.get(email, []))
 
     def start(
         self,
         emails: list[str],
-        subject: str,
-        body: str,
-        on_status: Callable[[str], None] | None = None,
-        on_result: Callable[[SendResult, int, int], None] | None = None,
-        on_complete: Callable[[bool, list[SendResult], list[str]], None] | None = None,
+        messages: list[Message],
+        on_status: Optional[StatusCallback] = None,
+        on_result: Optional[ResultCallback] = None,
+        on_complete: Optional[CompleteCallback] = None,
         is_retry: bool = False,
-        gmail_service: Resource | None = None,
     ) -> bool:
-        """Start the sending loop in a background thread."""
+        """Start the sending loop on a background thread."""
         if self.is_running:
             return False
 
         emails, _ = deduplicate_emails(emails)
-        errors = validate_send_inputs(emails, subject, body)
+        errors = validate_send_inputs(emails, messages)
         if errors:
             for error in errors:
                 logger.error("Send validation failed: %s", error)
             return False
 
-        if gmail_service is None:
-            logger.error("Gmail service not provided. Authenticate before starting send.")
+        if not self.client.is_logged_in():
+            logger.error("Not authenticated. Sign in before starting a send.")
             return False
 
-        if not is_retry:
+        if is_retry:
+            for email in emails:
+                self._retry_counts[email] = self._retry_counts.get(email, 0) + 1
+        else:
             self.reset_session()
+            for email in emails:
+                self._pending[email] = list(range(1, len(messages) + 1))
 
         self._stop_requested = False
         self._resume_event.set()
         self._thread = threading.Thread(
             target=self._send_loop,
-            args=(
-                gmail_service,
-                emails,
-                subject,
-                body,
-                on_status,
-                on_result,
-                on_complete,
-                is_retry,
-            ),
+            args=(emails, messages, on_status, on_result, on_complete),
             daemon=True,
         )
         self._thread.start()
@@ -176,36 +168,32 @@ class EmailSender:
     def start_retry(
         self,
         emails: list[str],
-        subject: str,
-        body: str,
-        on_status: Callable[[str], None] | None = None,
-        on_result: Callable[[SendResult, int, int], None] | None = None,
-        on_complete: Callable[[bool, list[SendResult], list[str]], None] | None = None,
-        gmail_service: Resource | None = None,
+        messages: list[Message],
+        on_status: Optional[StatusCallback] = None,
+        on_result: Optional[ResultCallback] = None,
+        on_complete: Optional[CompleteCallback] = None,
     ) -> bool:
-        """Re-queue and resend failed emails."""
+        """Resend only the messages a recipient never received."""
         return self.start(
             emails=emails,
-            subject=subject,
-            body=body,
+            messages=messages,
             on_status=on_status,
             on_result=on_result,
             on_complete=on_complete,
             is_retry=True,
-            gmail_service=gmail_service,
         )
 
     def stop(self) -> None:
-        """Safely request cancellation of the sending loop."""
+        """Request cancellation. The in-flight send finishes first."""
         self._stop_requested = True
         self._resume_event.set()
 
     def pause(self) -> None:
-        """Suspend the sending loop without losing queue position."""
+        """Suspend the loop without losing queue position."""
         self._resume_event.clear()
 
     def resume(self) -> None:
-        """Continue sending from where the loop was paused."""
+        """Continue from where the loop was paused."""
         self._resume_event.set()
 
     def _wait_until_resumed(self) -> bool:
@@ -213,97 +201,78 @@ class EmailSender:
         while not self._resume_event.is_set():
             if self._stop_requested:
                 return False
-            time.sleep(0.1)
+            time.sleep(0.05)
         return not self._stop_requested
 
-    def _sleep_seconds(self, seconds: int) -> None:
-        """Sleep for the given duration, honoring pause and stop."""
-        elapsed = 0
-        while elapsed < seconds:
+    def _sleep_interval(self) -> None:
+        """Wait between sends. A pause freezes the countdown rather than consuming it."""
+        remaining = self.interval_seconds
+        while remaining > 0:
             if self._stop_requested:
                 return
-
-            # Paused: wait without consuming interval time
             if not self._resume_event.is_set():
                 self._resume_event.wait(timeout=0.2)
                 continue
-
             time.sleep(1)
-            elapsed += 1
+            remaining -= 1
 
-    def _sleep_interval(self) -> None:
-        """Wait between sends, pausing without losing remaining delay."""
-        self._sleep_seconds(self.interval_seconds)
-
-    def _apply_retry_backoff(self, retry_attempt: int) -> None:
-        """Exponential backoff before a retry attempt."""
-        delay = BACKOFF_BASE_SECONDS * (2 ** (retry_attempt - 1))
-        logger.info("Retry backoff for attempt %s: %ss", retry_attempt, delay)
-        self._sleep_seconds(delay)
-
-    def _record_failure(self, email: str) -> None:
-        if email not in self._session_failed:
-            self._session_failed.append(email)
-
-    def _record_success(self, email: str) -> None:
-        if email in self._session_failed:
-            self._session_failed.remove(email)
-        self._retry_counts.pop(email, None)
+    def _plan(self, emails: list[str], messages: list[Message]) -> list[tuple[str, int]]:
+        """Flatten the queue into (email, message_index) steps in send order."""
+        steps: list[tuple[str, int]] = []
+        for email in emails:
+            for index in self._pending.get(email, list(range(1, len(messages) + 1))):
+                steps.append((email, index))
+        return steps
 
     def _send_loop(
         self,
-        service: Resource,
         emails: list[str],
-        subject: str,
-        body: str,
-        on_status: Callable[[str], None] | None,
-        on_result: Callable[[SendResult, int, int], None] | None,
-        on_complete: Callable[[bool, list[SendResult], list[str]], None] | None,
-        is_retry: bool,
+        messages: list[Message],
+        on_status: Optional[StatusCallback],
+        on_result: Optional[ResultCallback],
+        on_complete: Optional[CompleteCallback],
     ) -> None:
-        total = len(emails)
+        steps = self._plan(emails, messages)
+        total = len(steps)
         results: list[SendResult] = []
+        skip_email: Optional[str] = None
 
-        for index, email in enumerate(emails):
-            if self._stop_requested:
+        for position, (email, message_index) in enumerate(steps):
+            if self._stop_requested or not self._wait_until_resumed():
                 break
 
-            if not self._wait_until_resumed():
-                break
-
-            retry_attempt = 0
-            if is_retry:
-                retry_attempt = self._retry_counts.get(email, 0) + 1
-                self._apply_retry_backoff(retry_attempt)
-                if self._stop_requested:
-                    break
-                if not self._wait_until_resumed():
-                    break
+            # First message failed for this recipient — don't send them the follow-up.
+            if skip_email == email:
+                continue
+            skip_email = None
 
             if on_status:
-                on_status(email)
+                on_status(email, message_index)
 
-            result = self.send_email(service, email, subject, body)
-            result.retry_attempt = retry_attempt
+            message = messages[message_index - 1]
+            result = self.client.send_email(email, message.subject, message.body, message_index)
+            result.retry_attempt = self._retry_counts.get(email, 0)
             results.append(result)
 
             if result.success:
-                self._record_success(email)
-            elif is_retry:
-                self._retry_counts[email] = retry_attempt
-                if self._retry_counts[email] < MAX_RETRY_ATTEMPTS:
-                    self._record_failure(email)
+                owed = self._pending.get(email)
+                if owed and message_index in owed:
+                    owed.remove(message_index)
             else:
-                self._record_failure(email)
+                skip_email = email
 
             if on_result:
-                on_result(result, index + 1, total)
+                on_result(result, position + 1, total)
 
-            if self._stop_requested or index >= total - 1:
+            if self._stop_requested:
                 break
 
-            if not is_retry:
-                self._sleep_interval()
+            # Wait only if another message is actually going out after this one.
+            has_more = any(e != skip_email for e, _ in steps[position + 1 :])
+            if not has_more:
+                break
+
+            self._sleep_interval()
 
         if on_complete:
             retryable = [] if self._stop_requested else self.get_retryable_failed()

@@ -1,6 +1,8 @@
 {
-  "interval_seconds": 600,
+  "interval_seconds": 10,
   "theme": "light",
-  "default_subject": "Auto Message",
-  "default_body": "This is an automated message from Gmail Auto Sender."
+  "message1_subject": "Auto Message",
+  "message1_body": "Hello,\n\nThis is the first automated message.",
+  "message2_subject": "Auto Message — follow up",
+  "message2_body": "Hello again,111111111111111111111\n\nThis is the second automated message."
 }

@@ -564,3 +564,12 @@ If it does not open, copy the URL from the terminal into your browser.
 2026-05-28 08:10:44,720 [INFO] sender: Email sent to joseph.mixon@la.gov (message id: 19e6eb563e9a3e70)
 2026-05-28 08:20:48,685 [INFO] sender: Email sent to Love777mandy@gmail.com (message id: 19e6ebe9a70b97e6)
 2026-05-28 08:30:50,715 [INFO] sender: Email sent to mike.king@sophos.com (message id: 19e6ec7ca6285382)
+2026-06-21 07:43:54,559 [INFO] auth: Active provider set to: proton
+2026-07-10 11:42:39,411 [INFO] gmail_client: Connected to Gmail SMTP as elenaoliver0477@gmail.com
+2026-07-10 11:43:53,189 [ERROR] gmail_client: Gmail authentication failed for olegjandrjohn@gmail.com
+2026-07-10 11:46:15,559 [ERROR] gmail_client: Gmail authentication failed for olegjandrjohn@gmail.com
+2026-07-10 11:50:15,463 [INFO] gmail_client: Connected to Gmail SMTP as olegjandrjohn@gmail.com
+2026-07-10 11:52:14,804 [INFO] gmail_client: Gmail: message 1 sent to elenaoliver0477@gmail.com (<178370233249.136524.12007646530203106880@gmail.com>)
+2026-07-10 11:52:26,892 [INFO] gmail_client: Gmail: message 2 sent to elenaoliver0477@gmail.com (<178370234480.136524.112435152241941307@gmail.com>)
+2026-07-10 11:52:38,977 [INFO] gmail_client: Gmail: message 1 sent to m.djurdjevic0202@gmail.com (<178370235689.136524.15914230326665971974@gmail.com>)
+2026-07-10 11:52:51,039 [INFO] gmail_client: Gmail: message 2 sent to m.djurdjevic0202@gmail.com (<178370236898.136524.16604193831416247224@gmail.com>)

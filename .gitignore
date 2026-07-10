@@ -1,4 +1,27 @@
 
 # Ignore credentials containing sensitive keys
-credentials.json
-token.json
+gmail_credentials.json
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# PyInstaller build output
+build/
+dist/
+*.manifest
+
+# Logs
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
