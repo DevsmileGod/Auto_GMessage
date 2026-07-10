@@ -11,8 +11,10 @@ from gmail_client import (
     Credentials,
     GmailClient,
     build_client,
+    build_references,
     clear_credentials,
     load_credentials,
+    make_reply_subject,
     normalize_app_password,
     save_credentials,
 )
@@ -284,3 +286,61 @@ def test_send_after_a_dropped_socket_reconnects(fake_smtp):
 
     assert client.send_email("to@example.com", "s", "b").success
     assert len(fake_smtp.instances) == 2
+
+
+# --------------------------------------------------------------- reply send
+
+
+def test_send_reply_sets_threading_headers(fake_smtp):
+    client = build_client(CREDS)
+    result = client.send_reply(
+        to="to@example.com",
+        body="Thanks!",
+        in_reply_to="<their-reply@mail>",
+        references="<orig@x> <their-reply@mail>",
+        subject="Re: Hello",
+    )
+
+    assert result.success
+    assert result.message_index == 2
+    message = fake_smtp.instances[-1].sent[-1]
+    assert message["To"] == "to@example.com"
+    assert message["Subject"] == "Re: Hello"
+    assert message["In-Reply-To"] == "<their-reply@mail>"
+    assert message["References"] == "<orig@x> <their-reply@mail>"
+    assert message.get_content().strip() == "Thanks!"
+
+
+def test_send_reply_rejects_invalid_recipient(fake_smtp):
+    client = build_client(CREDS)
+    result = client.send_reply("bad", "b", "<x>", "<x>", "Re: x")
+    assert not result.success
+    assert "Invalid recipient" in result.error
+
+
+def test_plain_send_email_has_no_threading_headers(fake_smtp):
+    client = build_client(CREDS)
+    client.send_email("to@example.com", "Subject", "Body")
+    message = fake_smtp.instances[-1].sent[-1]
+    assert message["In-Reply-To"] is None
+    assert message["References"] is None
+
+
+@pytest.mark.parametrize(
+    "subject, expected",
+    [
+        ("Hello", "Re: Hello"),
+        ("Re: Hello", "Re: Hello"),
+        ("re: hello", "Re: hello"),
+        ("  RE:  Hello ", "Re: Hello"),
+        ("", "Re: "),
+    ],
+)
+def test_make_reply_subject_never_stacks_re(subject, expected):
+    assert make_reply_subject(subject) == expected
+
+
+def test_build_references_appends_without_duplicating():
+    assert build_references("<a@x> <b@x>", "<c@x>") == "<a@x> <b@x> <c@x>"
+    assert build_references("<a@x> <c@x>", "<c@x>") == "<a@x> <c@x>"
+    assert build_references("", "<c@x>") == "<c@x>"

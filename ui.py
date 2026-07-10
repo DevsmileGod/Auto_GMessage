@@ -1,4 +1,4 @@
-"""Tkinter GUI for Gmail Auto Sender."""
+"""Tkinter GUI for the Gmail outreach + auto-reply campaign."""
 
 import csv
 import json
@@ -8,9 +8,12 @@ import re
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
+from tkinter import filedialog, messagebox, scrolledtext, ttk
 
+import campaign_state
+import message_store
 import paths
+from campaign_state import CampaignState
 from exceptions import AuthenticationError, ConfigurationError
 from gmail_client import (
     Credentials,
@@ -22,64 +25,48 @@ from gmail_client import (
     normalize_app_password,
     save_credentials,
 )
-from sender import (
-    MESSAGES_PER_RECIPIENT,
-    EmailSender,
-    Message,
-    deduplicate_emails,
-    validate_send_inputs,
-)
+from imap_client import build_inbox
+from message_store import MessageStore
+from sender import Campaign, CampaignCallbacks, deduplicate_emails, validate_campaign
 
 CONFIG_PATH = paths.CONFIG_PATH
 LOG_DIR = paths.LOG_DIR
-TEMPLATES_PATH = paths.TEMPLATES_PATH
 
 EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
-
 PUMP_INTERVAL_MS = 50
 
-STATUS_UNREAD = "Unread"
+# Display statuses (a superset of the persisted ones — Sending/Replied are transient).
+STATUS_PENDING = "Pending"
 STATUS_SENDING = "Sending"
-STATUS_PARTIAL = "1 of 2"
 STATUS_SENT = "Sent"
 STATUS_FAILED = "Failed"
+STATUS_REPLIED = "Replied"
+STATUS_DONE = "Done"
 
 STATUS_TAGS = {
-    STATUS_UNREAD: "unread",
+    STATUS_PENDING: "pending",
     STATUS_SENDING: "sending",
-    STATUS_PARTIAL: "sending",
     STATUS_SENT: "sent",
     STATUS_FAILED: "failed",
+    STATUS_REPLIED: "replied",
+    STATUS_DONE: "done",
 }
 
 THEMES = {
     "light": {
-        "bg": "#f5f5f5",
-        "fg": "#212529",
-        "text_bg": "#ffffff",
-        "text_fg": "#212529",
-        "insert": "#212529",
-        "select_bg": "#cce5ff",
-        "disabled_bg": "#e9ecef",
+        "bg": "#f5f5f5", "fg": "#212529", "text_bg": "#ffffff", "text_fg": "#212529",
+        "insert": "#212529", "select_bg": "#cce5ff", "disabled_bg": "#e9ecef",
     },
     "dark": {
-        "bg": "#2b2b2b",
-        "fg": "#e0e0e0",
-        "text_bg": "#3c3c3c",
-        "text_fg": "#e0e0e0",
-        "insert": "#ffffff",
-        "select_bg": "#4a6fa5",
-        "disabled_bg": "#323232",
+        "bg": "#2b2b2b", "fg": "#e0e0e0", "text_bg": "#3c3c3c", "text_fg": "#e0e0e0",
+        "insert": "#ffffff", "select_bg": "#4a6fa5", "disabled_bg": "#323232",
     },
 }
 
 DEFAULT_CONFIG = {
     "interval_seconds": 30,
+    "poll_interval_seconds": 60,
     "theme": "light",
-    "message1_subject": "Auto Message",
-    "message1_body": "This is the first automated message.",
-    "message2_subject": "Auto Message — follow up",
-    "message2_body": "This is the second automated message.",
 }
 
 
@@ -87,9 +74,7 @@ def create_app_icon() -> tk.PhotoImage:
     """Build a simple mail envelope icon using tkinter PhotoImage."""
     size = 64
     img = tk.PhotoImage(width=size, height=size)
-    green = "#28a745"
-    white = "#ffffff"
-
+    green, white = "#28a745", "#ffffff"
     for y in range(size):
         row = []
         for x in range(size):
@@ -98,7 +83,6 @@ def create_app_icon() -> tk.PhotoImage:
             in_seal = 28 <= x <= 36 and 38 <= y <= 44
             row.append(white if (in_body or in_flap or in_seal) else green)
         img.put("{" + " ".join(row) + "}", to=(0, y))
-
     return img
 
 
@@ -114,22 +98,18 @@ def load_csv_emails(parent: tk.Misc) -> list[str] | None:
 
     valid_emails: list[str] = []
     seen: set[str] = set()
-
     try:
         with open(path, newline="", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
             if not reader.fieldnames:
                 messagebox.showerror("Load CSV", "The CSV file is empty or has no header row.")
                 return None
-
             email_key = next(
-                (name for name in reader.fieldnames if name.strip().lower() == "email"),
-                None,
+                (n for n in reader.fieldnames if n.strip().lower() == "email"), None
             )
             if email_key is None:
                 messagebox.showerror("Load CSV", "CSV must contain a column named 'email'.")
                 return None
-
             for row in reader:
                 address = (row.get(email_key) or "").strip()
                 if EMAIL_PATTERN.match(address) and address.lower() not in seen:
@@ -142,21 +122,37 @@ def load_csv_emails(parent: tk.Misc) -> list[str] | None:
     if not valid_emails:
         messagebox.showwarning("Load CSV", "No valid email addresses found in the 'email' column.")
         return []
-
     messagebox.showinfo("Load CSV", f"Loaded {len(valid_emails)} valid emails")
     return valid_emails
 
 
+def format_duration(seconds: float) -> str:
+    """Seconds -> a short 'Xh Ym' / 'Ym' / '<1m' string."""
+    seconds = max(0, int(seconds))
+    hours, minutes = seconds // 3600, (seconds % 3600) // 60
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m"
+    return "<1m"
+
+
+def format_cooldown(seconds: float) -> str:
+    return "Ready" if seconds <= 0 else f"Locked {format_duration(seconds)}"
+
+
 class SignInDialog(tk.Toplevel):
-    """Collect a Gmail address and app password, then verify them against Gmail."""
+    """Collect a Gmail address and app password, then verify SMTP (and try IMAP)."""
 
     def __init__(self, parent: tk.Misc, initial: Credentials | None = None):
         super().__init__(parent)
         self.title("Sign in to Gmail")
-        self.geometry("440x300")
+        self.geometry("460x340")
         self.resizable(False, False)
         self.transient(parent)
         self.client: GmailClient | None = None
+        self.inbox = None
+        self.imap_error: str | None = None
 
         frame = ttk.Frame(self, padding=16)
         frame.pack(fill=tk.BOTH, expand=True)
@@ -165,7 +161,6 @@ class SignInDialog(tk.Toplevel):
         ttk.Label(frame, text="Gmail Account", font=("Segoe UI", 11, "bold")).grid(
             row=0, column=0, sticky=tk.W, pady=(0, 12)
         )
-
         ttk.Label(frame, text="Email address:").grid(row=1, column=0, sticky=tk.W, pady=(0, 4))
         self.email_var = tk.StringVar(value=initial.email if initial else "")
         email_entry = ttk.Entry(frame, textvariable=self.email_var)
@@ -173,25 +168,24 @@ class SignInDialog(tk.Toplevel):
 
         ttk.Label(frame, text="App password:").grid(row=3, column=0, sticky=tk.W, pady=(0, 4))
         self.password_var = tk.StringVar(value=initial.app_password if initial else "")
-        password_entry = ttk.Entry(frame, textvariable=self.password_var, show="•")
-        password_entry.grid(row=4, column=0, sticky=tk.EW, pady=(0, 10))
+        ttk.Entry(frame, textvariable=self.password_var, show="•").grid(
+            row=4, column=0, sticky=tk.EW, pady=(0, 10)
+        )
 
         self.remember_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            frame, text="Remember on this computer", variable=self.remember_var
-        ).grid(row=5, column=0, sticky=tk.W, pady=(0, 8))
+        ttk.Checkbutton(frame, text="Remember on this computer", variable=self.remember_var).grid(
+            row=5, column=0, sticky=tk.W, pady=(0, 8)
+        )
 
         ttk.Label(
             frame,
             text=(
-                "Google requires a 16-character App Password for SMTP.\n"
-                "Enable 2-Step Verification, then create one at\n"
-                "myaccount.google.com/apppasswords"
+                "Needs a 16-character App Password (myaccount.google.com/apppasswords)\n"
+                "AND IMAP enabled (Gmail → Settings → Forwarding and POP/IMAP)\n"
+                "so the app can detect replies."
             ),
-            font=("Segoe UI", 8),
-            foreground="#888",
-            justify=tk.LEFT,
-        ).grid(row=6, column=0, sticky=tk.W, pady=(0, 12))
+            font=("Segoe UI", 8), foreground="#888", justify=tk.LEFT,
+        ).grid(row=6, column=0, sticky=tk.W, pady=(0, 10))
 
         self.status_var = tk.StringVar(value="")
         ttk.Label(frame, textvariable=self.status_var, font=("Segoe UI", 9)).grid(
@@ -206,19 +200,17 @@ class SignInDialog(tk.Toplevel):
 
         self.bind("<Return>", lambda _e: self._connect())
         email_entry.focus_set()
-
         self.grab_set()
         self.wait_window()
 
     def _connect(self) -> None:
         email = self.email_var.get().strip()
         password = normalize_app_password(self.password_var.get())
-
         if not email or not password:
             messagebox.showwarning("Sign in", "Email and app password are required.", parent=self)
             return
 
-        self.status_var.set("Connecting to Gmail...")
+        self.status_var.set("Connecting to Gmail (SMTP)...")
         self.connect_btn.configure(state=tk.DISABLED)
         self.update_idletasks()
 
@@ -230,6 +222,14 @@ class SignInDialog(tk.Toplevel):
             self.connect_btn.configure(state=tk.NORMAL)
             messagebox.showerror("Sign in failed", str(exc), parent=self)
             return
+
+        self.status_var.set("Checking inbox access (IMAP)...")
+        self.update_idletasks()
+        try:
+            self.inbox = build_inbox(credentials)
+        except (AuthenticationError, ConfigurationError) as exc:
+            self.inbox = None
+            self.imap_error = str(exc)
 
         if self.remember_var.get():
             try:
@@ -243,89 +243,96 @@ class SignInDialog(tk.Toplevel):
         self.destroy()
 
 
-class MessageEditor(ttk.Frame):
-    """Subject + body editor for one of the two messages."""
+class FirstMessageDialog(tk.Toplevel):
+    """Create or edit one first-message (subject + body)."""
 
-    def __init__(self, parent: tk.Misc, subject: str = "", body: str = ""):
-        super().__init__(parent, padding=8)
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(3, weight=1)
+    def __init__(self, parent: tk.Misc, subject: str = "", body: str = "", title: str = "First message"):
+        super().__init__(parent)
+        self.title(title)
+        self.geometry("520x420")
+        self.transient(parent)
+        self.result: tuple[str, str] | None = None
 
-        ttk.Label(self, text="Subject:", style="Section.TLabel").grid(
+        frame = ttk.Frame(self, padding=14)
+        frame.pack(fill=tk.BOTH, expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(3, weight=1)
+
+        ttk.Label(frame, text="Subject:", font=("Segoe UI", 10, "bold")).grid(
             row=0, column=0, sticky=tk.W, pady=(0, 4)
         )
         self.subject_var = tk.StringVar(value=subject)
-        ttk.Entry(self, textvariable=self.subject_var, font=("Segoe UI", 10)).grid(
-            row=1, column=0, sticky=tk.EW, pady=(0, 8)
-        )
+        subject_entry = ttk.Entry(frame, textvariable=self.subject_var, font=("Segoe UI", 10))
+        subject_entry.grid(row=1, column=0, sticky=tk.EW, pady=(0, 10))
 
-        ttk.Label(self, text="Body:", style="Section.TLabel").grid(row=2, column=0, sticky=tk.NW)
-        self.body_text = scrolledtext.ScrolledText(
-            self, height=12, wrap=tk.WORD, font=("Segoe UI", 10), relief=tk.FLAT, borderwidth=1
+        ttk.Label(frame, text="Body:", font=("Segoe UI", 10, "bold")).grid(
+            row=2, column=0, sticky=tk.W, pady=(0, 4)
         )
-        self.body_text.grid(row=3, column=0, sticky=tk.NSEW, pady=(4, 0))
+        self.body_text = scrolledtext.ScrolledText(frame, height=12, wrap=tk.WORD, font=("Segoe UI", 10))
+        self.body_text.grid(row=3, column=0, sticky=tk.NSEW)
         self.body_text.insert("1.0", body)
 
-    def get_message(self) -> Message:
-        return Message(
-            subject=self.subject_var.get().strip(),
-            body=self.body_text.get("1.0", tk.END).strip(),
-        )
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=4, column=0, sticky=tk.EW, pady=(12, 0))
+        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(buttons, text="Save", command=self._save).pack(side=tk.RIGHT)
 
-    def set_message(self, subject: str, body: str) -> None:
-        self.subject_var.set(subject)
-        self.body_text.delete("1.0", tk.END)
-        self.body_text.insert("1.0", body)
+        subject_entry.focus_set()
+        self.grab_set()
+        self.wait_window()
+
+    def _save(self) -> None:
+        subject = self.subject_var.get().strip()
+        body = self.body_text.get("1.0", tk.END).strip()
+        if not subject or not body:
+            messagebox.showwarning("First message", "Both subject and body are required.", parent=self)
+            return
+        self.result = (subject, body)
+        self.destroy()
 
 
 class GmailAutoSenderApp:
     """Main application window."""
 
     def __init__(self, root: tk.Misc | None = None):
-        # Tests inject a Toplevel so the whole suite shares one Tcl interpreter;
-        # repeatedly creating and destroying Tk() roots is unreliable on Windows.
         self.root = root if root is not None else tk.Tk()
         self.root.title("Gmail Auto Sender")
-        self.root.geometry("1000x780")
-        self.root.minsize(880, 660)
+        self.root.geometry("1040x820")
+        self.root.minsize(920, 700)
 
         self.config = self._load_config()
         self._setup_logging()
         self._setup_styles()
         self._setup_icon()
 
+        self._store = MessageStore(message_store.MESSAGES_PATH)
+        self._state = CampaignState(campaign_state.STATE_PATH)
         self._client: GmailClient | None = None
-        self._email_sender: EmailSender | None = None
-        self._send_total = 0
-        self._send_completed = 0
-        self._templates: dict[str, dict] = {}
-        self._last_messages: list[Message] = []
-        self._recipient_records: dict[str, dict] = {}
+        self._inbox = None
+        self._campaign: Campaign | None = None
 
-        # Tk is not thread-safe. The sender thread hands work to this queue and
-        # the Tk thread runs it; calling root.after() from the worker crashes on
-        # a non-threaded Tcl build.
         self._ui_queue: queue.Queue = queue.Queue()
         self._pump_id: str | None = None
         self._closing = False
 
         self._build_ui()
-        self._refresh_template_dropdown()
         self._apply_theme(self.config.get("theme", "light"))
+        self._refresh_first_list()
+        self._load_second_into_editor()
+        self._refresh_recipients_table()
+        self._refresh_start_button()
         self._update_control_states("idle")
         self._pump()
         self._restore_saved_session()
-
+        self._announce_resumable()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ------------------------------------------------------------ ui thread
 
     def _post(self, callback) -> None:
-        """Queue a callback to run on the Tk thread. Safe from any thread."""
         self._ui_queue.put(callback)
 
     def _pump(self) -> None:
-        """Drain queued callbacks, then reschedule. Runs only on the Tk thread."""
         if self._closing:
             return
         while True:
@@ -336,11 +343,11 @@ class GmailAutoSenderApp:
             try:
                 callback()
             except tk.TclError:
-                return  # window went away mid-drain
+                return
         if not self._closing:
             self._pump_id = self.root.after(PUMP_INTERVAL_MS, self._pump)
 
-    # ---------------------------------------------------------------- config
+    # -------------------------------------------------------------- config
 
     def _load_config(self) -> dict:
         config = dict(DEFAULT_CONFIG)
@@ -379,7 +386,6 @@ class GmailAutoSenderApp:
             style.theme_use("vista")
         elif "clam" in style.theme_names():
             style.theme_use("clam")
-
         style.configure("Title.TLabel", font=("Segoe UI", 16, "bold"))
         style.configure("Section.TLabel", font=("Segoe UI", 10, "bold"))
         style.configure("Status.TLabel", font=("Segoe UI", 10))
@@ -389,109 +395,121 @@ class GmailAutoSenderApp:
         theme = THEMES.get(theme_name, THEMES["light"])
         self.config["theme"] = theme_name
         self.root.configure(bg=theme["bg"])
-
         style = ttk.Style()
         style.configure(".", background=theme["bg"], foreground=theme["fg"])
         for name in (
-            "TFrame",
-            "TLabel",
-            "Title.TLabel",
-            "Section.TLabel",
-            "Status.TLabel",
-            "Progress.TLabel",
-            "TLabelframe",
-            "TLabelframe.Label",
-            "TNotebook",
+            "TFrame", "TLabel", "Title.TLabel", "Section.TLabel", "Status.TLabel",
+            "Progress.TLabel", "TLabelframe", "TLabelframe.Label",
         ):
             style.configure(name, background=theme["bg"], foreground=theme["fg"])
         style.configure("TEntry", fieldbackground=theme["text_bg"], foreground=theme["text_fg"])
-        style.configure("TCombobox", fieldbackground=theme["text_bg"], foreground=theme["text_fg"])
         style.configure(
-            "Treeview",
-            background=theme["text_bg"],
-            foreground=theme["text_fg"],
+            "Treeview", background=theme["text_bg"], foreground=theme["text_fg"],
             fieldbackground=theme["text_bg"],
         )
         style.configure("Treeview.Heading", background=theme["bg"], foreground=theme["fg"])
 
         self._paste_colors = (theme["text_bg"], theme["disabled_bg"])
-        text_widgets = [self.log_text, self.paste_text]
-        text_widgets += [editor.body_text for editor in self._editors]
-        for widget in text_widgets:
+        for widget in (self.log_text, self.paste_text, self.second_text):
             widget.configure(
-                bg=theme["text_bg"],
-                fg=theme["text_fg"],
-                insertbackground=theme["insert"],
-                selectbackground=theme["select_bg"],
+                bg=theme["text_bg"], fg=theme["text_fg"],
+                insertbackground=theme["insert"], selectbackground=theme["select_bg"],
             )
 
-        self.recipients_tree.tag_configure("unread", foreground=theme["fg"])
-        self.recipients_tree.tag_configure("sending", foreground="#007bff")
-        self.recipients_tree.tag_configure("sent", foreground="#28a745")
-        self.recipients_tree.tag_configure("failed", foreground="#dc3545")
+        for tree in (self.first_tree, self.recipients_tree):
+            tree.tag_configure("pending", foreground=theme["fg"])
+            tree.tag_configure("sending", foreground="#007bff")
+            tree.tag_configure("sent", foreground="#17a2b8")
+            tree.tag_configure("failed", foreground="#dc3545")
+            tree.tag_configure("replied", foreground="#6f42c1")
+            tree.tag_configure("done", foreground="#28a745")
+            tree.tag_configure("ready", foreground="#28a745")
+            tree.tag_configure("locked", foreground="#fd7e14")
 
         self.theme_btn.configure(text="Light Mode" if theme_name == "dark" else "Dark Mode")
 
     def _toggle_theme(self) -> None:
-        next_theme = "dark" if self.config.get("theme", "light") == "light" else "light"
-        self._apply_theme(next_theme)
+        self._apply_theme("dark" if self.config.get("theme", "light") == "light" else "light")
         self._save_config()
 
     # ------------------------------------------------------------------ auth
 
     def _restore_saved_session(self) -> None:
-        """Reconnect with saved credentials, without blocking startup on failure."""
         credentials = load_credentials()
         if credentials is None:
             self._append_log("No saved credentials. Click Sign in to connect.", "info")
             self.status_var.set("Not signed in")
             return
-
         self.status_var.set(f"Reconnecting as {credentials.email}...")
         self.root.update_idletasks()
         try:
-            self._set_client(build_client(credentials))
+            client = build_client(credentials)
         except (AuthenticationError, ConfigurationError) as exc:
             self.status_var.set("Not signed in")
             self._append_log(f"Saved credentials rejected: {exc}", "fail")
+            return
+        inbox = None
+        try:
+            inbox = build_inbox(credentials)
+        except (AuthenticationError, ConfigurationError) as exc:
+            self._append_log(f"IMAP unavailable — replies can't be detected yet: {exc}", "fail")
+        self._set_session(client, inbox)
 
-    def _set_client(self, client: GmailClient) -> None:
+    def _set_session(self, client: GmailClient, inbox) -> None:
         self._client = client
-        interval = int(self.config.get("interval_seconds", 30))
-        self._email_sender = EmailSender(client, interval_seconds=interval)
+        self._inbox = inbox
         self.account_var.set(f"Signed in: {client.email}")
-        self.status_var.set(f"Connected as {client.email}")
+        imap_note = "" if inbox is not None else "  (IMAP off — reply detection disabled)"
+        self.status_var.set(f"Connected as {client.email}{imap_note}")
         self._append_log(f"Signed in as {client.email}.", "success")
+        if inbox is None:
+            self._append_log("IMAP is off; enable it in Gmail to auto-send replies.", "fail")
+
+    def _announce_resumable(self) -> None:
+        if not self._state.has_resumable_work():
+            return
+        counts = self._state.counts()
+        contacted = counts[campaign_state.STATUS_SENT] + counts[campaign_state.STATUS_DONE]
+        total = len(self._state.recipients)
+        self._append_log(
+            f"Campaign in progress: {contacted}/{total} contacted, {counts[campaign_state.STATUS_DONE]} "
+            f"replied. Click Resume campaign to continue.",
+            "info",
+        )
+        self.status_var.set("Campaign paused — click Resume campaign to continue.")
 
     def _sign_in(self) -> bool:
-        if self._email_sender and self._email_sender.is_running:
-            messagebox.showwarning("Sign in", "Stop sending before changing accounts.")
+        if self._campaign and self._campaign.is_running:
+            messagebox.showwarning("Sign in", "Stop the campaign before changing accounts.")
             return False
-
         dialog = SignInDialog(self.root, initial=load_credentials())
         if dialog.client is None:
             return False
-
+        if dialog.imap_error:
+            messagebox.showwarning("IMAP not available", dialog.imap_error)
         if self._client is not None:
             self._client.close()
-        self._set_client(dialog.client)
+        if self._inbox is not None:
+            self._inbox.close()
+        self._set_session(dialog.client, dialog.inbox)
         return True
 
     def _sign_out(self) -> None:
-        if self._email_sender and self._email_sender.is_running:
-            messagebox.showwarning("Sign out", "Stop sending before signing out.")
+        if self._campaign and self._campaign.is_running:
+            messagebox.showwarning("Sign out", "Stop the campaign before signing out.")
             return
         if self._client is not None:
             self._client.close()
+        if self._inbox is not None:
+            self._inbox.close()
         self._client = None
-        self._email_sender = None
+        self._inbox = None
         clear_credentials()
         self.account_var.set("Not signed in")
         self.status_var.set("Signed out")
         self._append_log("Signed out and removed saved credentials.", "info")
 
     def _ensure_login(self) -> bool:
-        """Return True if a usable client exists, prompting for sign-in if not."""
         if self._client is not None and self._client.is_logged_in():
             return True
         return self._sign_in()
@@ -501,7 +519,7 @@ class GmailAutoSenderApp:
     def _open_settings(self) -> None:
         dialog = tk.Toplevel(self.root)
         dialog.title("Settings")
-        dialog.geometry("380x210")
+        dialog.geometry("400x260")
         dialog.resizable(False, False)
         dialog.transient(self.root)
         dialog.grab_set()
@@ -509,51 +527,41 @@ class GmailAutoSenderApp:
         frame = ttk.Frame(dialog, padding=16)
         frame.pack(fill=tk.BOTH, expand=True)
 
-        ttk.Label(frame, text="Send interval (seconds):", style="Section.TLabel").grid(
-            row=0, column=0, sticky=tk.W, pady=(0, 8)
-        )
-
+        ttk.Label(frame, text="Send interval between first messages (seconds):",
+                  style="Section.TLabel").grid(row=0, column=0, sticky=tk.W, pady=(0, 4))
         interval_var = tk.IntVar(value=int(self.config.get("interval_seconds", 30)))
         ttk.Spinbox(frame, from_=5, to=3600, increment=5, textvariable=interval_var, width=10).grid(
             row=1, column=0, sticky=tk.W, pady=(0, 12)
         )
 
-        ttk.Label(
-            frame,
-            text=(
-                "Waits this long after every message:\n"
-                "message 1 → wait → message 2 → wait → next recipient."
-            ),
-            style="Progress.TLabel",
-            justify=tk.LEFT,
-        ).grid(row=2, column=0, sticky=tk.W, pady=(0, 16))
+        ttk.Label(frame, text="Inbox check interval for replies (seconds):",
+                  style="Section.TLabel").grid(row=2, column=0, sticky=tk.W, pady=(0, 4))
+        poll_var = tk.IntVar(value=int(self.config.get("poll_interval_seconds", 60)))
+        ttk.Spinbox(frame, from_=15, to=3600, increment=15, textvariable=poll_var, width=10).grid(
+            row=3, column=0, sticky=tk.W, pady=(0, 12)
+        )
 
         def save_settings() -> None:
             try:
                 interval = int(interval_var.get())
+                poll = int(poll_var.get())
             except tk.TclError:
-                messagebox.showwarning("Settings", "Enter a valid interval.", parent=dialog)
+                messagebox.showwarning("Settings", "Enter valid numbers.", parent=dialog)
                 return
-
-            if not 5 <= interval <= 3600:
-                messagebox.showwarning(
-                    "Settings", "Interval must be between 5 and 3600 seconds.", parent=dialog
-                )
+            if not 5 <= interval <= 3600 or not 15 <= poll <= 3600:
+                messagebox.showwarning("Settings", "Values out of range.", parent=dialog)
                 return
-
             self.config["interval_seconds"] = interval
-            if self._email_sender is not None:
-                self._email_sender.interval_seconds = interval
-            self.interval_label_var.set(f"Interval: {interval}s after each message")
+            self.config["poll_interval_seconds"] = poll
+            self.interval_label_var.set(f"Interval: {interval}s  ·  Poll: {poll}s")
             self._save_config()
-            self._append_log(f"Send interval updated to {interval}s.", "info")
+            self._append_log(f"Interval {interval}s, poll {poll}s.", "info")
             dialog.destroy()
 
         btn_row = ttk.Frame(frame)
-        btn_row.grid(row=3, column=0, sticky=tk.EW)
+        btn_row.grid(row=4, column=0, sticky=tk.EW)
         ttk.Button(btn_row, text="Save", command=save_settings).pack(side=tk.RIGHT, padx=(6, 0))
         ttk.Button(btn_row, text="Cancel", command=dialog.destroy).pack(side=tk.RIGHT)
-
         dialog.wait_window()
 
     # -------------------------------------------------------------------- ui
@@ -562,23 +570,18 @@ class GmailAutoSenderApp:
         container = ttk.Frame(self.root, padding=16)
         container.pack(fill=tk.BOTH, expand=True)
 
-        header_bar = ttk.Frame(container)
-        header_bar.pack(fill=tk.X, pady=(0, 12))
-
-        ttk.Label(header_bar, text="Gmail Auto Sender", style="Title.TLabel").pack(side=tk.LEFT)
-
+        header = ttk.Frame(container)
+        header.pack(fill=tk.X, pady=(0, 12))
+        ttk.Label(header, text="Gmail Auto Sender", style="Title.TLabel").pack(side=tk.LEFT)
         self.account_var = tk.StringVar(value="Not signed in")
-        ttk.Label(header_bar, textvariable=self.account_var, style="Status.TLabel").pack(
+        ttk.Label(header, textvariable=self.account_var, style="Status.TLabel").pack(
             side=tk.LEFT, padx=(16, 0)
         )
-
-        toolbar = ttk.Frame(header_bar)
+        toolbar = ttk.Frame(header)
         toolbar.pack(side=tk.RIGHT)
         self.theme_btn = ttk.Button(toolbar, text="Dark Mode", command=self._toggle_theme)
         self.theme_btn.pack(side=tk.RIGHT, padx=(6, 0))
-        ttk.Button(toolbar, text="Settings", command=self._open_settings).pack(
-            side=tk.RIGHT, padx=(6, 0)
-        )
+        ttk.Button(toolbar, text="Settings", command=self._open_settings).pack(side=tk.RIGHT, padx=(6, 0))
         ttk.Button(toolbar, text="Sign out", command=self._sign_out).pack(side=tk.RIGHT, padx=(6, 0))
         ttk.Button(toolbar, text="Sign in", command=self._sign_in).pack(side=tk.RIGHT, padx=(6, 0))
 
@@ -588,275 +591,282 @@ class GmailAutoSenderApp:
         content.columnconfigure(1, weight=1)
         content.rowconfigure(0, weight=1)
 
-        # Left panel — the two messages
-        message_panel = ttk.LabelFrame(
-            content, text="Messages (both are sent to every recipient)", padding=10
+        self._build_message_panel(content)
+        self._build_recipients_panel(content)
+        self._build_controls(container)
+        self._build_log(container)
+
+    def _build_message_panel(self, parent: tk.Misc) -> None:
+        panel = ttk.Frame(parent)
+        panel.grid(row=0, column=0, sticky=tk.NSEW, padx=(0, 8))
+        panel.columnconfigure(0, weight=1)
+        panel.rowconfigure(0, weight=3)
+        panel.rowconfigure(1, weight=2)
+
+        first = ttk.LabelFrame(
+            panel, text="First messages — one unique message per recipient (24h lock)", padding=10
         )
-        message_panel.grid(row=0, column=0, sticky=tk.NSEW, padx=(0, 8))
-        message_panel.columnconfigure(0, weight=1)
-        message_panel.rowconfigure(1, weight=1)
+        first.grid(row=0, column=0, sticky=tk.NSEW, pady=(0, 8))
+        first.columnconfigure(0, weight=1)
+        first.rowconfigure(0, weight=1)
 
-        template_bar = ttk.Frame(message_panel)
-        template_bar.grid(row=0, column=0, sticky=tk.EW, pady=(0, 8))
-        template_bar.columnconfigure(1, weight=1)
-
-        ttk.Label(template_bar, text="Template:", style="Section.TLabel").grid(
-            row=0, column=0, sticky=tk.W, padx=(0, 6)
+        tree_wrap = ttk.Frame(first)
+        tree_wrap.grid(row=0, column=0, sticky=tk.NSEW)
+        tree_wrap.columnconfigure(0, weight=1)
+        tree_wrap.rowconfigure(0, weight=1)
+        self.first_tree = ttk.Treeview(
+            tree_wrap, columns=("subject", "state"), show="headings", selectmode="browse", height=6
         )
-        self.template_var = tk.StringVar()
-        self.template_combo = ttk.Combobox(
-            template_bar, textvariable=self.template_var, state="readonly", font=("Segoe UI", 10)
+        self.first_tree.heading("subject", text="Subject")
+        self.first_tree.heading("state", text="Availability")
+        self.first_tree.column("subject", width=260, anchor=tk.W)
+        self.first_tree.column("state", width=110, anchor=tk.CENTER, stretch=False)
+        self.first_tree.grid(row=0, column=0, sticky=tk.NSEW)
+        self.first_tree.bind("<Double-1>", lambda _e: self._edit_first())
+        scroll = ttk.Scrollbar(tree_wrap, orient=tk.VERTICAL, command=self.first_tree.yview)
+        self.first_tree.configure(yscrollcommand=scroll.set)
+        scroll.grid(row=0, column=1, sticky=tk.NS)
+
+        first_btns = ttk.Frame(first)
+        first_btns.grid(row=1, column=0, sticky=tk.EW, pady=(6, 0))
+        self.first_new_btn = ttk.Button(first_btns, text="New", command=self._new_first)
+        self.first_new_btn.pack(side=tk.LEFT, padx=(0, 4))
+        self.first_edit_btn = ttk.Button(first_btns, text="Edit", command=self._edit_first)
+        self.first_edit_btn.pack(side=tk.LEFT, padx=(0, 4))
+        self.first_del_btn = ttk.Button(first_btns, text="Delete", command=self._delete_first)
+        self.first_del_btn.pack(side=tk.LEFT, padx=(0, 4))
+        self.first_reset_btn = ttk.Button(first_btns, text="Clear locks", command=self._reset_locks)
+        self.first_reset_btn.pack(side=tk.LEFT)
+        self.first_count_var = tk.StringVar(value="")
+        ttk.Label(first_btns, textvariable=self.first_count_var, style="Progress.TLabel").pack(side=tk.RIGHT)
+
+        second = ttk.LabelFrame(
+            panel, text="Second message — auto-reply after they respond (body only)", padding=10
         )
-        self.template_combo.grid(row=0, column=1, sticky=tk.EW, padx=(0, 6))
-        ttk.Button(template_bar, text="Load", command=self._load_template).grid(
-            row=0, column=2, padx=(0, 6)
+        second.grid(row=1, column=0, sticky=tk.NSEW)
+        second.columnconfigure(0, weight=1)
+        second.rowconfigure(0, weight=1)
+        self.second_text = scrolledtext.ScrolledText(
+            second, height=6, wrap=tk.WORD, font=("Segoe UI", 10), relief=tk.FLAT, borderwidth=1
         )
-        ttk.Button(template_bar, text="Save", command=self._save_template).grid(row=0, column=3)
-
-        notebook = ttk.Notebook(message_panel)
-        notebook.grid(row=1, column=0, sticky=tk.NSEW)
-
-        self._editors: list[MessageEditor] = []
-        for index in (1, 2):
-            editor = MessageEditor(
-                notebook,
-                subject=self.config.get(f"message{index}_subject", ""),
-                body=self.config.get(f"message{index}_body", ""),
-            )
-            notebook.add(editor, text=f"Message {index}")
-            self._editors.append(editor)
-
-        # Right panel — recipients
-        recipients_panel = ttk.LabelFrame(content, text="Recipients", padding=10)
-        recipients_panel.grid(row=0, column=1, sticky=tk.NSEW, padx=(8, 0))
-        recipients_panel.columnconfigure(0, weight=1)
-        recipients_panel.rowconfigure(2, weight=1)
-
+        self.second_text.grid(row=0, column=0, sticky=tk.NSEW)
+        second_btns = ttk.Frame(second)
+        second_btns.grid(row=1, column=0, sticky=tk.EW, pady=(6, 0))
+        self.second_save_btn = ttk.Button(second_btns, text="Save reply", command=self._save_second)
+        self.second_save_btn.pack(side=tk.LEFT, padx=(0, 4))
+        self.second_clear_btn = ttk.Button(second_btns, text="Clear", command=self._clear_second)
+        self.second_clear_btn.pack(side=tk.LEFT)
         ttk.Label(
-            recipients_panel,
-            text="Paste emails below (one per line), then click Import",
-            style="Section.TLabel",
-        ).grid(row=0, column=0, sticky=tk.W, pady=(0, 4))
+            second_btns, text="Sent as a real Reply — subject becomes \"Re: …\" automatically.",
+            style="Progress.TLabel",
+        ).pack(side=tk.RIGHT)
 
-        import_bar = ttk.Frame(recipients_panel)
+    def _build_recipients_panel(self, parent: tk.Misc) -> None:
+        panel = ttk.LabelFrame(parent, text="Recipients", padding=10)
+        panel.grid(row=0, column=1, sticky=tk.NSEW, padx=(8, 0))
+        panel.columnconfigure(0, weight=1)
+        panel.rowconfigure(2, weight=1)
+
+        ttk.Label(panel, text="Paste emails (one per line), then Import", style="Section.TLabel").grid(
+            row=0, column=0, sticky=tk.W, pady=(0, 4)
+        )
+        import_bar = ttk.Frame(panel)
         import_bar.grid(row=1, column=0, sticky=tk.EW, pady=(0, 6))
         import_bar.columnconfigure(0, weight=1)
-
         self.paste_text = scrolledtext.ScrolledText(
             import_bar, height=4, wrap=tk.NONE, font=("Consolas", 9), relief=tk.FLAT, borderwidth=1
         )
         self.paste_text.grid(row=0, column=0, sticky=tk.EW, columnspan=4, pady=(0, 4))
-
-        self.import_btn = ttk.Button(
-            import_bar, text="Import", command=self._import_recipients_from_paste
-        )
+        self.import_btn = ttk.Button(import_bar, text="Import", command=self._import_recipients_from_paste)
         self.import_btn.grid(row=1, column=0, sticky=tk.W, padx=(0, 4))
         self.csv_btn = ttk.Button(import_bar, text="Load CSV", command=self._load_csv)
         self.csv_btn.grid(row=1, column=1, sticky=tk.W, padx=(0, 4))
-        self.delete_btn = ttk.Button(
-            import_bar, text="Delete Selected", command=self._delete_selected_recipients
-        )
+        self.delete_btn = ttk.Button(import_bar, text="Delete Selected", command=self._delete_selected_recipients)
         self.delete_btn.grid(row=1, column=2, sticky=tk.W, padx=(0, 4))
         self.clear_btn = ttk.Button(import_bar, text="Clear All", command=self._clear_recipients)
         self.clear_btn.grid(row=1, column=3, sticky=tk.W)
 
-        tree_frame = ttk.Frame(recipients_panel)
+        tree_frame = ttk.Frame(panel)
         tree_frame.grid(row=2, column=0, sticky=tk.NSEW)
         tree_frame.columnconfigure(0, weight=1)
         tree_frame.rowconfigure(0, weight=1)
-
-        columns = ("sent", "num", "email", "status")
         self.recipients_tree = ttk.Treeview(
-            tree_frame, columns=columns, show="headings", selectmode="extended", height=14
+            tree_frame, columns=("num", "email", "status"), show="headings",
+            selectmode="extended", height=14,
         )
         self.recipients_tree.bind("<Delete>", lambda _e: self._delete_selected_recipients())
-        for column, heading, width, anchor, stretch in (
-            ("sent", "Sent", 44, tk.CENTER, False),
-            ("num", "#", 36, tk.CENTER, False),
-            ("email", "Email", 220, tk.W, True),
-            ("status", "Status", 80, tk.CENTER, False),
+        for col, head, width, anchor, stretch in (
+            ("num", "#", 40, tk.CENTER, False),
+            ("email", "Email", 230, tk.W, True),
+            ("status", "Status", 90, tk.CENTER, False),
         ):
-            self.recipients_tree.heading(column, text=heading)
-            self.recipients_tree.column(column, width=width, anchor=anchor, stretch=stretch)
-
-        tree_scroll = ttk.Scrollbar(
-            tree_frame, orient=tk.VERTICAL, command=self.recipients_tree.yview
-        )
-        self.recipients_tree.configure(yscrollcommand=tree_scroll.set)
+            self.recipients_tree.heading(col, text=head)
+            self.recipients_tree.column(col, width=width, anchor=anchor, stretch=stretch)
+        scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.recipients_tree.yview)
+        self.recipients_tree.configure(yscrollcommand=scroll.set)
         self.recipients_tree.grid(row=0, column=0, sticky=tk.NSEW)
-        tree_scroll.grid(row=0, column=1, sticky=tk.NS)
+        scroll.grid(row=0, column=1, sticky=tk.NS)
 
-        self.recipient_stats_var = tk.StringVar(value="Total: 0 | Sent: 0 | Unread: 0 | Failed: 0")
+        self.recipient_stats_var = tk.StringVar(value="Total: 0 | Contacted: 0 | Done: 0 | Pending: 0 | Failed: 0")
+        ttk.Label(panel, textvariable=self.recipient_stats_var, style="Progress.TLabel").grid(
+            row=3, column=0, sticky=tk.W, pady=(6, 0)
+        )
         ttk.Label(
-            recipients_panel, textvariable=self.recipient_stats_var, style="Progress.TLabel"
-        ).grid(row=3, column=0, sticky=tk.W, pady=(6, 0))
-
-        ttk.Label(
-            recipients_panel,
-            text="Tip: Ctrl+click or Shift+click to select multiple rows",
+            panel,
+            text="The ▸ marker is the resume point — the next recipient to be contacted.",
             style="Progress.TLabel",
         ).grid(row=4, column=0, sticky=tk.W, pady=(4, 0))
 
-        # Controls
-        controls = ttk.Frame(container)
+    def _build_controls(self, parent: tk.Misc) -> None:
+        controls = ttk.Frame(parent)
         controls.pack(fill=tk.X, pady=12)
+        btns = ttk.Frame(controls)
+        btns.pack(side=tk.LEFT)
 
-        btn_frame = ttk.Frame(controls)
-        btn_frame.pack(side=tk.LEFT)
-
-        def action_button(text, command, bg, active_bg, fg="white", active_fg="white"):
+        def action(text, command, bg, active, fg="white", afg="white"):
             return tk.Button(
-                btn_frame,
-                text=text,
-                command=command,
-                bg=bg,
-                fg=fg,
-                activebackground=active_bg,
-                activeforeground=active_fg,
-                font=("Segoe UI", 10, "bold"),
-                relief=tk.FLAT,
-                padx=20,
-                pady=8,
-                cursor="hand2",
+                btns, text=text, command=command, bg=bg, fg=fg, activebackground=active,
+                activeforeground=afg, font=("Segoe UI", 10, "bold"), relief=tk.FLAT,
+                padx=20, pady=8, cursor="hand2",
             )
 
-        self.send_btn = action_button("Send", self.start, "#28a745", "#218838")
+        self.send_btn = action("Start campaign", self.start, "#28a745", "#218838")
         self.send_btn.pack(side=tk.LEFT, padx=(0, 8))
-        self.stop_btn = action_button("Stop", self.stop, "#dc3545", "#c82333")
+        self.stop_btn = action("Stop", self.stop, "#dc3545", "#c82333")
         self.stop_btn.pack(side=tk.LEFT, padx=(0, 8))
-        self.pause_btn = action_button(
-            "Pause", self.pause, "#ffc107", "#e0a800", fg="#212529", active_fg="#212529"
-        )
+        self.pause_btn = action("Pause", self.pause, "#ffc107", "#e0a800", fg="#212529", afg="#212529")
         self.pause_btn.pack(side=tk.LEFT, padx=(0, 8))
-        self.resume_btn = action_button("Resume", self.resume, "#007bff", "#0069d9")
+        self.resume_btn = action("Resume", self.resume, "#007bff", "#0069d9")
         self.resume_btn.pack(side=tk.LEFT)
 
         self.interval_label_var = tk.StringVar(
-            value=f"Interval: {self.config.get('interval_seconds', 30)}s after each message"
+            value=f"Interval: {self.config.get('interval_seconds', 30)}s  ·  "
+                  f"Poll: {self.config.get('poll_interval_seconds', 60)}s"
         )
-        ttk.Label(controls, textvariable=self.interval_label_var, style="Progress.TLabel").pack(
-            side=tk.RIGHT
-        )
+        ttk.Label(controls, textvariable=self.interval_label_var, style="Progress.TLabel").pack(side=tk.RIGHT)
 
-        # Progress
-        progress_frame = ttk.Frame(container)
-        progress_frame.pack(fill=tk.X, pady=(0, 8))
-        progress_frame.columnconfigure(0, weight=1)
-
+        progress = ttk.Frame(parent)
+        progress.pack(fill=tk.X, pady=(0, 8))
+        progress.columnconfigure(0, weight=1)
         self.progress_var = tk.DoubleVar(value=0)
-        ttk.Progressbar(
-            progress_frame, variable=self.progress_var, maximum=100, mode="determinate"
-        ).grid(row=0, column=0, sticky=tk.EW)
-
-        self.progress_label_var = tk.StringVar(value="0/0 messages")
-        ttk.Label(progress_frame, textvariable=self.progress_label_var, style="Progress.TLabel").grid(
+        ttk.Progressbar(progress, variable=self.progress_var, maximum=100, mode="determinate").grid(
+            row=0, column=0, sticky=tk.EW
+        )
+        self.progress_label_var = tk.StringVar(value="0/0 contacted")
+        ttk.Label(progress, textvariable=self.progress_label_var, style="Progress.TLabel").grid(
             row=0, column=1, padx=(10, 0)
         )
 
         self.status_var = tk.StringVar(value="Ready")
-        ttk.Label(container, textvariable=self.status_var, style="Status.TLabel").pack(
-            anchor=tk.W, pady=(0, 8)
-        )
+        ttk.Label(parent, textvariable=self.status_var, style="Status.TLabel").pack(anchor=tk.W, pady=(0, 8))
 
-        # Live log
-        log_panel = ttk.LabelFrame(container, text="Live Log", padding=10)
-        log_panel.pack(fill=tk.BOTH, expand=True)
-        log_panel.columnconfigure(0, weight=1)
-        log_panel.rowconfigure(0, weight=1)
-
+    def _build_log(self, parent: tk.Misc) -> None:
+        panel = ttk.LabelFrame(parent, text="Live Log", padding=10)
+        panel.pack(fill=tk.BOTH, expand=True)
+        panel.columnconfigure(0, weight=1)
+        panel.rowconfigure(0, weight=1)
         self.log_text = scrolledtext.ScrolledText(
-            log_panel,
-            height=9,
-            wrap=tk.WORD,
-            font=("Consolas", 9),
-            state=tk.DISABLED,
-            relief=tk.FLAT,
-            borderwidth=1,
+            panel, height=8, wrap=tk.WORD, font=("Consolas", 9), state=tk.DISABLED,
+            relief=tk.FLAT, borderwidth=1,
         )
         self.log_text.grid(row=0, column=0, sticky=tk.NSEW)
         self.log_text.tag_configure("success", foreground="#28a745")
         self.log_text.tag_configure("fail", foreground="#dc3545")
-        self.log_text.tag_configure("info", foreground="#555555")
+        self.log_text.tag_configure("info", foreground="#777777")
 
-    # ------------------------------------------------------------- templates
+    # -------------------------------------------------- first-message CRUD
 
-    def _load_templates(self) -> dict[str, dict]:
-        if not TEMPLATES_PATH.exists():
-            return {}
-        try:
-            with TEMPLATES_PATH.open(encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                return data
-        except (OSError, json.JSONDecodeError):
-            messagebox.showerror("Templates", "Could not read templates.json.")
-        return {}
+    def _refresh_first_list(self) -> None:
+        selected = self.first_tree.selection()
+        selected_id = selected[0] if selected else None
+        for item in self.first_tree.get_children():
+            self.first_tree.delete(item)
+        for message in self._store.first_pool:
+            preview = (message.subject or "(no subject)")[:60]
+            state = format_cooldown(message.cooldown_remaining())
+            tag = "ready" if message.is_available() else "locked"
+            self.first_tree.insert("", tk.END, iid=message.id, values=(preview, state), tags=(tag,))
+        if selected_id and selected_id in self.first_tree.get_children():
+            self.first_tree.selection_set(selected_id)
+        available = self._store.available_count()
+        self.first_count_var.set(f"{len(self._store.first_pool)} messages · {available} ready")
 
-    def _write_templates(self, templates: dict[str, dict]) -> bool:
-        try:
-            with TEMPLATES_PATH.open("w", encoding="utf-8") as f:
-                json.dump(templates, f, indent=2, ensure_ascii=False)
-            return True
-        except OSError as exc:
-            messagebox.showerror("Templates", f"Could not save templates:\n{exc}")
-            return False
+    def _selected_first_id(self) -> str | None:
+        selection = self.first_tree.selection()
+        return selection[0] if selection else None
 
-    def _refresh_template_dropdown(self) -> None:
-        self._templates = self._load_templates()
-        names = sorted(self._templates.keys())
-        self.template_combo["values"] = names
-        if names and self.template_var.get() not in names:
-            self.template_var.set(names[0])
-        elif not names:
-            self.template_var.set("")
+    def _new_first(self) -> None:
+        dialog = FirstMessageDialog(self.root, title="New first message")
+        if dialog.result:
+            subject, body = dialog.result
+            self._store.add_first(subject, body)
+            self._refresh_first_list()
+            self._append_log(f'Added first message: "{subject[:40]}"', "info")
 
-    def _save_template(self) -> None:
-        messages = [editor.get_message() for editor in self._editors]
-        if all(m.is_empty() for m in messages):
-            messagebox.showwarning("Save Template", "Both messages are empty.")
+    def _edit_first(self) -> None:
+        message_id = self._selected_first_id()
+        if not message_id:
+            messagebox.showwarning("Edit", "Select a message to edit.")
             return
-
-        name = simpledialog.askstring("Save Template", "Template name:", parent=self.root)
-        if not name or not name.strip():
+        message = self._store.get_first(message_id)
+        if message is None:
+            self._refresh_first_list()
             return
-        name = name.strip()
+        dialog = FirstMessageDialog(
+            self.root, subject=message.subject, body=message.body, title="Edit first message"
+        )
+        if dialog.result:
+            subject, body = dialog.result
+            self._store.update_first(message_id, subject, body)
+            self._refresh_first_list()
+            self._append_log(f'Edited first message: "{subject[:40]}"', "info")
 
-        self._templates[name] = {
-            f"message{i}": {"subject": m.subject, "body": m.body}
-            for i, m in enumerate(messages, start=1)
-        }
-        if self._write_templates(self._templates):
-            self._refresh_template_dropdown()
-            self.template_var.set(name)
-            self._append_log(f'Template saved: "{name}"', "info")
-
-    def _load_template(self) -> None:
-        name = self.template_var.get().strip()
-        if not name:
-            messagebox.showwarning("Load Template", "Select a template from the dropdown.")
+    def _delete_first(self) -> None:
+        message_id = self._selected_first_id()
+        if not message_id:
+            messagebox.showwarning("Delete", "Select a message to delete.")
             return
-
-        template = self._templates.get(name)
-        if template is None:
-            self._refresh_template_dropdown()
-            messagebox.showwarning("Load Template", f'Template "{name}" was not found.')
+        message = self._store.get_first(message_id)
+        label = (message.subject[:40] if message else message_id)
+        if not messagebox.askyesno("Delete", f'Delete first message "{label}"?'):
             return
+        self._store.delete_first(message_id)
+        self._refresh_first_list()
+        self._append_log("Deleted a first message.", "info")
 
-        # Templates written before two-message support hold a single subject/body pair.
-        if "subject" in template or "body" in template:
-            legacy = {"subject": template.get("subject", ""), "body": template.get("body", "")}
-            template = {"message1": legacy, "message2": legacy}
+    def _reset_locks(self) -> None:
+        if not messagebox.askyesno(
+            "Clear locks", "Clear all 24h locks so every message is available again?"
+        ):
+            return
+        self._store.reset_cooldowns()
+        self._refresh_first_list()
+        self._append_log("Cleared all 24h message locks.", "info")
 
-        for index, editor in enumerate(self._editors, start=1):
-            part = template.get(f"message{index}", {})
-            editor.set_message(part.get("subject", ""), part.get("body", ""))
+    # --------------------------------------------------------- second message
 
-        self._append_log(f'Template loaded: "{name}"', "info")
+    def _load_second_into_editor(self) -> None:
+        self.second_text.delete("1.0", tk.END)
+        self.second_text.insert("1.0", self._store.second_body)
+
+    def _save_second(self) -> None:
+        body = self.second_text.get("1.0", tk.END).strip()
+        if not body:
+            messagebox.showwarning("Reply message", "The reply body is empty.")
+            return
+        self._store.set_second(body)
+        self._append_log("Saved the second (reply) message.", "info")
+
+    def _clear_second(self) -> None:
+        if not messagebox.askyesno("Clear", "Clear the second (reply) message?"):
+            return
+        self._store.clear_second()
+        self._load_second_into_editor()
+        self._append_log("Cleared the second (reply) message.", "info")
 
     # ------------------------------------------------------------ recipients
 
     def _extract_emails(self, text: str) -> list[str]:
-        """Pull valid addresses out of pasted text (one per line, or comma/semicolon separated)."""
         emails = []
         for line in text.splitlines():
             for candidate in re.split(r"[,;\s]+", line):
@@ -868,153 +878,118 @@ class GmailAutoSenderApp:
     def _recipient_key(self, email: str) -> str:
         return email.strip().lower()
 
-    def _is_sending(self) -> bool:
-        return self._email_sender is not None and self._email_sender.is_running
+    def _is_running(self) -> bool:
+        return self._campaign is not None and self._campaign.is_running
 
-    def _clear_recipients(self) -> None:
-        if self._is_sending():
-            messagebox.showwarning("Recipients", "Stop sending before clearing the list.")
-            return
-        if not self._recipient_records:
-            return
-        if not messagebox.askyesno("Clear All", "Remove all recipients from the list?"):
-            return
+    def _refresh_recipients_table(self) -> None:
         for item in self.recipients_tree.get_children():
             self.recipients_tree.delete(item)
-        self._recipient_records.clear()
+        cursor = self._state.cursor
+        for index, record in enumerate(self._state.recipients):
+            key = self._recipient_key(record.email)
+            marker = "▸" if (index == cursor and self._state.active) else ""
+            tag = STATUS_TAGS.get(record.status, "pending")
+            self.recipients_tree.insert(
+                "", tk.END, iid=key, values=(f"{marker}{index + 1}", record.email, record.status),
+                tags=(tag,),
+            )
         self._refresh_recipient_stats()
-        self._append_log("Cleared all recipients.", "info")
 
-    def _renumber_recipients(self) -> None:
-        for num, key in enumerate(self.recipients_tree.get_children(), start=1):
-            record = self._recipient_records.get(key)
-            if record:
-                self._write_row(key, record, num)
-
-    def _write_row(self, key: str, record: dict, num: int) -> None:
-        check = "☑" if record["sent"] else "☐"
-        tag = STATUS_TAGS.get(record["status"], "unread")
-        self.recipients_tree.item(
-            key, values=(check, num, record["email"], record["status"]), tags=(tag,)
-        )
+    def _clear_recipients(self) -> None:
+        if self._is_running():
+            messagebox.showwarning("Recipients", "Stop the campaign before clearing the list.")
+            return
+        if not self._state.recipients:
+            return
+        if not messagebox.askyesno(
+            "Clear All", "Remove all recipients and reset this campaign's progress?"
+        ):
+            return
+        self._state.clear()
+        self._refresh_recipients_table()
+        self._refresh_start_button()
+        self._append_log("Cleared all recipients and reset campaign progress.", "info")
 
     def _delete_selected_recipients(self) -> None:
-        if self._is_sending():
-            messagebox.showwarning("Delete", "Stop sending before deleting recipients.")
+        if self._is_running():
+            messagebox.showwarning("Delete", "Stop the campaign before deleting recipients.")
             return
-
         selected = self.recipients_tree.selection()
         if not selected:
             messagebox.showwarning(
-                "Delete",
-                "Select one or more recipients to delete.\n\n"
+                "Delete", "Select one or more recipients to delete.\n\n"
                 "Use Ctrl+click to select multiple, or Shift+click for a range.",
             )
             return
-
         count = len(selected)
-        if count == 1:
-            record = self._recipient_records.get(selected[0])
-            prompt = f"Delete {record['email'] if record else selected[0]}?"
-        else:
-            prompt = f"Delete {count} selected recipients?"
-
+        prompt = (
+            f"Delete {self._state.get(selected[0]).email}?" if count == 1
+            else f"Delete {count} selected recipients?"
+        )
         if not messagebox.askyesno("Delete Recipients", prompt):
             return
-
-        for key in selected:
-            self.recipients_tree.delete(key)
-            self._recipient_records.pop(key, None)
-
-        self._renumber_recipients()
-        self._refresh_recipient_stats()
+        self._state.remove_emails(list(selected))
+        # Removing rows shifts the cursor; keep it pointing at an un-contacted slot.
+        self._state.cursor = min(self._state.cursor, len(self._state.recipients))
+        self._state.save()
+        self._refresh_recipients_table()
+        self._refresh_start_button()
         self._append_log(f"Deleted {count} recipient(s).", "info")
 
     def _add_recipients(self, emails: list[str]) -> int:
-        """Add emails to the recipient list. Returns the number newly added."""
-        unique, duplicates_removed = deduplicate_emails(emails)
-        added = 0
-
-        for email in unique:
-            key = self._recipient_key(email)
-            if key in self._recipient_records:
-                continue
-
-            self._recipient_records[key] = {
-                "email": email,
-                "sent": False,
-                "status": STATUS_UNREAD,
-            }
-            self.recipients_tree.insert("", tk.END, iid=key)
-            added += 1
-
-        self._renumber_recipients()
-        self._refresh_recipient_stats()
-
-        if duplicates_removed:
-            self._append_log(f"Skipped {duplicates_removed} duplicate address(es).", "info")
-
+        unique, duplicates = deduplicate_emails(emails)
+        added = self._state.add_emails(unique)
+        self._refresh_recipients_table()
+        self._refresh_start_button()
+        if duplicates:
+            self._append_log(f"Skipped {duplicates} duplicate address(es) in the paste.", "info")
         return added
 
     def _get_recipient_emails(self) -> list[str]:
-        emails = []
-        for key in self.recipients_tree.get_children():
-            record = self._recipient_records.get(key)
-            if record:
-                emails.append(record["email"])
-        return emails
+        return self._state.emails()
 
-    def _set_recipient_row(self, email: str, status: str, sent: bool | None = None) -> None:
+    def _set_recipient_row(self, email: str, status: str) -> None:
+        """Update one row's visible status (transient states like Sending/Replied)."""
         key = self._recipient_key(email)
-        record = self._recipient_records.get(key)
-        if not record:
-            return
-
-        if sent is not None:
-            record["sent"] = sent
-        record["status"] = status
-
         children = self.recipients_tree.get_children()
-        num = children.index(key) + 1 if key in children else 0
-        self._write_row(key, record, num)
-
-    def _reset_recipients_for_send(self, emails: list[str]) -> None:
-        for email in emails:
-            self._set_recipient_row(email, STATUS_UNREAD, sent=False)
+        if key not in children:
+            return
+        index = children.index(key)
+        marker = "▸" if (index == self._state.cursor and self._state.active) else ""
+        self.recipients_tree.item(
+            key, values=(f"{marker}{index + 1}", email, status),
+            tags=(STATUS_TAGS.get(status, "pending"),),
+        )
+        self.recipients_tree.see(key)
 
     def _refresh_recipient_stats(self) -> None:
-        records = self._recipient_records.values()
-        total = len(self._recipient_records)
-        sent = sum(1 for r in records if r["sent"])
-        unread = sum(1 for r in records if r["status"] == STATUS_UNREAD)
-        failed = sum(1 for r in records if r["status"] == STATUS_FAILED)
+        counts = self._state.counts()
+        total = len(self._state.recipients)
+        contacted = counts[campaign_state.STATUS_SENT] + counts[campaign_state.STATUS_DONE]
         self.recipient_stats_var.set(
-            f"Total: {total} | Sent: {sent} | Unread: {unread} | Failed: {failed}"
+            f"Total: {total} | Contacted: {contacted} | Done: {counts[campaign_state.STATUS_DONE]} "
+            f"| Pending: {counts[campaign_state.STATUS_PENDING]} | Failed: {counts[campaign_state.STATUS_FAILED]}"
         )
 
     def _import_recipients_from_paste(self) -> None:
-        if self._is_sending():
-            messagebox.showwarning("Import", "Stop sending before importing recipients.")
+        if self._is_running():
+            messagebox.showwarning("Import", "Stop the campaign before importing recipients.")
             return
-
-        text = self.paste_text.get("1.0", tk.END)
-        raw = self._extract_emails(text)
+        raw = self._extract_emails(self.paste_text.get("1.0", tk.END))
         if not raw:
             messagebox.showwarning("Import", "No valid email addresses found.")
             return
-
         added = self._add_recipients(raw)
         self.paste_text.delete("1.0", tk.END)
         self.paste_text.focus_set()
-
         if added:
             self._append_log(f"Imported {added} recipient(s).", "info")
         else:
             messagebox.showinfo("Import", "All addresses are already in the list.")
 
     def _load_csv(self) -> None:
-        if self._is_sending():
-            messagebox.showwarning("Load CSV", "Stop sending before importing recipients.")
+        if self._is_running():
+            messagebox.showwarning("Load CSV", "Stop the campaign before importing recipients.")
             return
         emails = load_csv_emails(self.root)
         if not emails:
@@ -1043,10 +1018,14 @@ class GmailAutoSenderApp:
         self.log_text.configure(state=tk.DISABLED)
         self._write_session_log(message)
 
-    # -------------------------------------------------------------- controls
+    # ------------------------------------------------------------- controls
+
+    def _refresh_start_button(self) -> None:
+        self.send_btn.configure(
+            text="Resume campaign" if self._state.has_resumable_work() else "Start campaign"
+        )
 
     def _update_control_states(self, state: str) -> None:
-        """Drive every stateful widget from one place: idle, sending, or paused."""
         sending = state == "sending"
         paused = state == "paused"
         idle = state == "idle"
@@ -1056,232 +1035,216 @@ class GmailAutoSenderApp:
         self.pause_btn.configure(state=tk.NORMAL if sending else tk.DISABLED)
         self.resume_btn.configure(state=tk.NORMAL if paused else tk.DISABLED)
 
-        for button in (self.import_btn, self.csv_btn, self.delete_btn, self.clear_btn):
+        editing_buttons = (
+            self.import_btn, self.csv_btn, self.delete_btn, self.clear_btn,
+            self.first_new_btn, self.first_edit_btn, self.first_del_btn,
+            self.first_reset_btn, self.second_save_btn, self.second_clear_btn,
+        )
+        for button in editing_buttons:
             button.configure(state=tk.NORMAL if idle else tk.DISABLED)
 
-        # The paste box is the one widget that must never be left disabled — a
-        # send that ends any way other than "idle" used to strand it read-only.
         normal_bg, disabled_bg = getattr(self, "_paste_colors", ("#ffffff", "#e9ecef"))
-        self.paste_text.configure(
-            state=tk.NORMAL if idle else tk.DISABLED,
-            bg=normal_bg if idle else disabled_bg,
-        )
+        for widget in (self.paste_text, self.second_text):
+            widget.configure(
+                state=tk.NORMAL if idle else tk.DISABLED,
+                bg=normal_bg if idle else disabled_bg,
+            )
 
     def _update_progress(self, current: int, total: int) -> None:
-        self.progress_label_var.set(f"{current}/{total} messages")
+        self.progress_label_var.set(f"{current}/{total} contacted")
         self.progress_var.set((current / total) * 100 if total else 0)
 
-    # ------------------------------------------------------------- callbacks
+    # ------------------------------------------------------ campaign events
 
-    def _on_send_status(self, email: str, message_index: int) -> None:
+    def _campaign_callbacks(self) -> CampaignCallbacks:
+        return CampaignCallbacks(
+            on_first_sending=self._ev_first_sending,
+            on_first_result=self._ev_first_result,
+            on_waiting=self._ev_waiting,
+            on_phase_watch=self._ev_watch,
+            on_reply_detected=self._ev_reply,
+            on_second_result=self._ev_second_result,
+            on_complete=self._ev_complete,
+        )
+
+    def _ev_first_sending(self, email: str) -> None:
         def update() -> None:
-            self.status_var.set(f"Sending message {message_index} to {email}...")
             self._set_recipient_row(email, STATUS_SENDING)
-
+            self.status_var.set(f"Sending first message to {email}...")
         self._post(update)
 
-    def _on_send_result(self, result: SendResult, current: int, total: int) -> None:
+    def _ev_first_result(self, result: SendResult, cursor: int, total: int) -> None:
         def update() -> None:
-            timestamp = datetime.now().strftime("%H:%M:%S")
+            ts = datetime.now().strftime("%H:%M:%S")
             if result.success:
-                self._append_log(
-                    f"✅ Message {result.message_index} sent to {result.email} — {timestamp}",
-                    "success",
-                )
+                self._append_log(f"✅ First message sent to {result.email} — {ts}", "success")
+                self._set_recipient_row(result.email, STATUS_SENT)
             else:
-                self._append_log(
-                    f"❌ Message {result.message_index} failed for {result.email}"
-                    f" — {timestamp} ({result.error})",
-                    "fail",
-                )
-                if result.message_index < MESSAGES_PER_RECIPIENT:
-                    self._append_log(
-                        f"   Skipping message {result.message_index + 1} for {result.email}.",
-                        "info",
-                    )
-
-            self._send_completed = current
-            self._update_progress(current, total)
-
-            if not result.success:
-                self._set_recipient_row(result.email, STATUS_FAILED, sent=False)
-            elif self._email_sender and self._email_sender.pending_messages(result.email):
-                self._set_recipient_row(result.email, STATUS_PARTIAL, sent=False)
-            else:
-                self._set_recipient_row(result.email, STATUS_SENT, sent=True)
-
+                self._append_log(f"❌ First message failed: {result.email} — {ts} ({result.error})", "fail")
+                self._set_recipient_row(result.email, STATUS_FAILED)
+            self._update_progress(cursor, total)
             self._refresh_recipient_stats()
-
-            key = self._recipient_key(result.email)
-            if key in self.recipients_tree.get_children():
-                self.recipients_tree.see(key)
-
+            self._refresh_first_list()
         self._post(update)
 
-    def _on_send_complete(
-        self, stopped: bool, _results: list[SendResult], failed_emails: list[str]
-    ) -> None:
+    def _ev_waiting(self, seconds: float, contacted: int, total: int) -> None:
+        def update() -> None:
+            self.status_var.set(
+                f"Batch done — {contacted}/{total} contacted. Waiting ~{format_duration(seconds)} "
+                f"for message locks; the next batch resumes automatically (even if you close the app)."
+            )
+            self._refresh_recipients_table()  # move the ▸ resume marker
+        self._post(update)
+
+    def _ev_watch(self, awaiting: int, answered: int) -> None:
+        self._post(lambda: self.status_var.set(
+            f"Watching inbox for replies — {awaiting} awaiting, {answered} answered..."
+        ))
+
+    def _ev_reply(self, email: str) -> None:
+        def update() -> None:
+            self._append_log(f"📨 Reply received from {email} — sending follow-up...", "info")
+            self._set_recipient_row(email, STATUS_REPLIED)
+        self._post(update)
+
+    def _ev_second_result(self, result: SendResult) -> None:
+        def update() -> None:
+            ts = datetime.now().strftime("%H:%M:%S")
+            if result.success:
+                self._append_log(f"✅ Reply sent to {result.email} — {ts}", "success")
+                self._set_recipient_row(result.email, STATUS_DONE)
+            else:
+                self._append_log(f"❌ Reply failed: {result.email} — {ts} ({result.error})", "fail")
+                self._set_recipient_row(result.email, STATUS_SENT)
+            self._refresh_recipient_stats()
+        self._post(update)
+
+    def _ev_complete(self, stopped: bool) -> None:
         def finish() -> None:
-            retry_started = False
-            try:
-                if stopped:
-                    for record in self._recipient_records.values():
-                        if record["status"] in (STATUS_SENDING, STATUS_PARTIAL):
-                            self._set_recipient_row(
-                                record["email"], STATUS_UNREAD, sent=record["sent"]
-                            )
-                    self._refresh_recipient_stats()
-                    self.status_var.set("Stopped.")
-                    self._append_log("Sending stopped by user.", "info")
-                    return
-
-                self._update_progress(self._send_total, self._send_total)
-                self.status_var.set("Finished sending.")
-                self._append_log("Sending complete.", "info")
-
-                if failed_emails:
-                    count = len(failed_emails)
-                    if messagebox.askyesno(
-                        "Retry Failed Emails",
-                        f"{count} recipient{'s' if count != 1 else ''} did not receive every "
-                        f"message. Retry only the undelivered messages?",
-                    ):
-                        retry_started = self._start_retry(failed_emails)
-                        return
-            finally:
-                # Every path that is not handing off to a retry must give the
-                # controls — above all the paste box — back to the user. Keyed on
-                # an explicit flag, not on is_running: on_complete fires from
-                # inside the worker thread, which is still alive at this point.
-                if not retry_started:
-                    self._update_control_states("idle")
-
+            if stopped:
+                self.status_var.set("Stopped — click Resume campaign to continue later.")
+                self._append_log("Campaign stopped. Progress saved; resume anytime.", "info")
+            else:
+                self.status_var.set("Campaign complete.")
+                self._append_log("Campaign complete — everyone contacted and all replies answered.", "info")
+            self._update_control_states("idle")
+            self._refresh_start_button()
+            self._refresh_recipients_table()
+            self._refresh_first_list()
         self._post(finish)
 
-    # ---------------------------------------------------------------- sending
+    # ---------------------------------------------------------------- start
 
-    def _begin_send_ui(self, total_messages: int, status: str) -> None:
-        self._update_control_states("sending")
-        self._send_total = total_messages
-        self._send_completed = 0
-        self._update_progress(0, total_messages)
-        self.status_var.set(status)
-
-    def _start_retry(self, failed_emails: list[str]) -> bool:
-        """Resend the undelivered messages. Returns True only if a send actually began."""
-        if not self._ensure_login() or self._email_sender is None:
-            return False
-
-        pending = sum(len(self._email_sender.pending_messages(e)) for e in failed_emails)
-        self._begin_send_ui(pending, "Retrying undelivered messages...")
-        self._append_log(f"Retrying {pending} undelivered message(s)...", "info")
-
-        for email in failed_emails:
-            self._set_recipient_row(email, STATUS_UNREAD, sent=False)
-
-        if not self._email_sender.start_retry(
-            emails=failed_emails,
-            messages=self._last_messages,
-            on_status=self._on_send_status,
-            on_result=self._on_send_result,
-            on_complete=self._on_send_complete,
-        ):
-            messagebox.showerror("Retry", "Could not start the retry.")
-            return False
-
-        return True
+    def _confirm_fresh_start(self, emails: list[str]) -> bool:
+        ready = self._store.available_count()
+        total = len(emails)
+        if ready >= total:
+            return messagebox.askyesno(
+                "Start campaign",
+                f"Send a first message to {total} recipient(s), then auto-reply to anyone who "
+                f"responds?",
+            )
+        return messagebox.askyesno(
+            "Start campaign (batched)",
+            f"{total} recipients, but only {ready} message(s) are ready now.\n\n"
+            f"The first {ready} will be contacted immediately. The rest are sent automatically "
+            f"in later batches as the 24h message locks expire — progress is saved, so you can "
+            f"close the app between batches.\n\nStart now?",
+        )
 
     def start(self) -> None:
-        if self._is_sending():
+        if self._is_running():
             return
-
         emails = self._get_recipient_emails()
-        messages = [editor.get_message() for editor in self._editors]
-
-        errors = validate_send_inputs(emails, messages)
+        errors = validate_campaign(emails, self._store)
         if errors:
-            messagebox.showwarning("Send", "\n".join(errors))
+            messagebox.showwarning("Start campaign", "\n".join(errors))
             return
+        if not self._ensure_login() or self._client is None:
+            return
+        if self._inbox is None:
+            messagebox.showerror(
+                "IMAP required",
+                "Reply detection needs IMAP. Enable it in Gmail "
+                "(Settings → Forwarding and POP/IMAP → Enable IMAP), then sign in again.",
+            )
+            return
+
+        resuming = self._state.has_resumable_work()
+        if resuming:
+            if not messagebox.askyesno(
+                "Resume campaign",
+                f"Resume from recipient #{self._state.cursor + 1} of {len(emails)}?",
+            ):
+                return
+        else:
+            if not self._confirm_fresh_start(emails):
+                return
+            self._state.begin()
+            self._refresh_recipients_table()
 
         interval = int(self.config.get("interval_seconds", 30))
-        total_messages = len(emails) * MESSAGES_PER_RECIPIENT
-        if not messagebox.askyesno(
-            "Confirm Send",
-            f"Send {MESSAGES_PER_RECIPIENT} messages to each of {len(emails)} recipient(s)?\n\n"
-            f"That is {total_messages} emails, {interval}s apart.",
-        ):
-            return
+        poll = int(self.config.get("poll_interval_seconds", 60))
+        self._campaign = Campaign(
+            self._client, self._store, self._inbox, self._state,
+            interval_seconds=interval, poll_interval_seconds=poll,
+        )
 
-        if not self._ensure_login() or self._email_sender is None:
-            return
-
-        self._last_messages = messages
-        self._reset_recipients_for_send(emails)
-
-        self._email_sender.interval_seconds = interval
-        self.interval_label_var.set(f"Interval: {interval}s after each message")
-
-        self._begin_send_ui(total_messages, "Starting...")
+        self._update_control_states("sending")
+        self._update_progress(self._state.cursor, len(emails))
+        self.status_var.set("Resuming campaign..." if resuming else "Starting campaign...")
         self._append_log(
-            f"Starting send: {MESSAGES_PER_RECIPIENT} messages × {len(emails)} recipient(s).",
+            f"{'Resuming' if resuming else 'Starting'} campaign — "
+            f"{self._state.cursor}/{len(emails)} already contacted.",
             "info",
         )
 
-        if not self._email_sender.start(
-            emails=emails,
-            messages=messages,
-            on_status=self._on_send_status,
-            on_result=self._on_send_result,
-            on_complete=self._on_send_complete,
-        ):
+        if not self._campaign.start(self._campaign_callbacks()):
             self._update_control_states("idle")
-            messagebox.showerror("Send", "Could not start sending. Check inputs and try again.")
+            messagebox.showerror("Start campaign", "Could not start. Check inputs and try again.")
 
     def pause(self) -> None:
-        if not self._is_sending() or self._email_sender.is_paused:
+        if not self._is_running() or self._campaign.is_paused:
             return
-        self._email_sender.pause()
+        self._campaign.pause()
         self._update_control_states("paused")
-        self.status_var.set(f"Paused at {self._send_completed}/{self._send_total}")
-        self._append_log(f"Paused at {self._send_completed}/{self._send_total}.", "info")
+        self.status_var.set("Paused.")
+        self._append_log("Campaign paused.", "info")
 
     def resume(self) -> None:
-        if not self._is_sending() or not self._email_sender.is_paused:
+        if not self._is_running() or not self._campaign.is_paused:
             return
-        self._email_sender.resume()
+        self._campaign.resume()
         self._update_control_states("sending")
         self.status_var.set("Resuming...")
-        self._append_log("Sending resumed.", "info")
+        self._append_log("Campaign resumed.", "info")
 
     def stop(self) -> None:
-        if not self._is_sending():
+        if not self._is_running():
             return
-        self._email_sender.stop()
+        self._campaign.stop()
         self.status_var.set("Stopping...")
-        self._append_log("Stop requested — finishing the current message...", "info")
+        self._append_log("Stop requested — finishing the current step...", "info")
 
     def _on_close(self) -> None:
-        if self._is_sending():
-            if not messagebox.askyesno("Quit", "A send is in progress. Stop it and quit?"):
+        if self._is_running():
+            if not messagebox.askyesno(
+                "Quit",
+                "A campaign is running. Quit and resume later?\n\n"
+                "Progress is saved — you can reopen the app and click Resume campaign.",
+            ):
                 return
-            self._email_sender.stop()
-
+            self._campaign.stop()
         self._closing = True
         if self._pump_id is not None:
             self.root.after_cancel(self._pump_id)
             self._pump_id = None
-
         if self._client is not None:
             self._client.close()
-        self._persist_messages()
-        self.root.destroy()
-
-    def _persist_messages(self) -> None:
-        for index, editor in enumerate(self._editors, start=1):
-            message = editor.get_message()
-            self.config[f"message{index}_subject"] = message.subject
-            self.config[f"message{index}_body"] = message.body
+        if self._inbox is not None:
+            self._inbox.close()
         self._save_config()
+        self.root.destroy()
 
     def run(self) -> None:
         self.root.mainloop()

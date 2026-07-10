@@ -1,5 +1,6 @@
 {
   "interval_seconds": 10,
+  "poll_interval_seconds": 15,
   "theme": "light",
   "message1_subject": "Auto Message",
   "message1_body": "Hello,\n\nThis is the first automated message.",

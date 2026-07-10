@@ -31,6 +31,21 @@ APP_PASSWORD_HELP = (
     "3. Create a password and paste it here (spaces are fine)."
 )
 
+_RE_PREFIX = re.compile(r"^\s*re\s*:\s*", re.IGNORECASE)
+
+
+def make_reply_subject(subject: str) -> str:
+    """"Some subject" -> "Re: Some subject"; never stacks "Re: Re:"."""
+    return "Re: " + _RE_PREFIX.sub("", subject or "").strip()
+
+
+def build_references(original_references: str, replied_message_id: str) -> str:
+    """Chain the References header: prior chain + the id we are replying to."""
+    parts = (original_references or "").split()
+    if replied_message_id and replied_message_id not in parts:
+        parts.append(replied_message_id)
+    return " ".join(parts)
+
 
 @dataclass
 class Credentials:
@@ -196,7 +211,14 @@ class GmailClient:
                 pass
             self._smtp = None
 
-    def _build_message(self, to: str, subject: str, body: str) -> EmailMessage:
+    def _build_message(
+        self,
+        to: str,
+        subject: str,
+        body: str,
+        in_reply_to: Optional[str] = None,
+        references: Optional[str] = None,
+    ) -> EmailMessage:
         message = EmailMessage()
         message["From"] = self._credentials.email
         message["To"] = to
@@ -205,22 +227,19 @@ class GmailClient:
         # Pin the domain: make_msgid() otherwise does a reverse-DNS lookup on every
         # call, which stalls each send and puts the local hostname in the headers.
         message["Message-ID"] = make_msgid(domain=self._helo_name())
+        # These two headers are what make Gmail file the message in the existing
+        # conversation instead of starting a new one — i.e. a real "Reply".
+        if in_reply_to:
+            message["In-Reply-To"] = in_reply_to
+        if references:
+            message["References"] = references
         # quoted-printable keeps the body 7-bit clean, so non-ASCII text does not
         # depend on the server advertising 8BITMIME.
         message.set_content(body, subtype="plain", charset="utf-8", cte="quoted-printable")
         return message
 
-    def send_email(self, to: str, subject: str, body: str, message_index: int = 1) -> SendResult:
-        """Send one email. Never raises — failure is reported in the result."""
-        if not EMAIL_PATTERN.match(to.strip()):
-            return SendResult(
-                email=to,
-                success=False,
-                message_index=message_index,
-                error="Invalid recipient address",
-            )
-
-        message = self._build_message(to.strip(), subject, body)
+    def _deliver(self, message: EmailMessage, to: str, message_index: int) -> SendResult:
+        """Send a pre-built message. Never raises — failure is reported in the result."""
         try:
             smtp = self._ensure_connection()
             smtp.send_message(message)
@@ -247,6 +266,40 @@ class GmailClient:
         message_id = message["Message-ID"]
         logger.info("Gmail: message %s sent to %s (%s)", message_index, to, message_id)
         return SendResult(email=to, success=True, message_index=message_index, message_id=message_id)
+
+    def send_email(self, to: str, subject: str, body: str, message_index: int = 1) -> SendResult:
+        """Send one standalone email (subject + body). Never raises."""
+        to = to.strip()
+        if not EMAIL_PATTERN.match(to):
+            return SendResult(
+                email=to, success=False, message_index=message_index, error="Invalid recipient address"
+            )
+        return self._deliver(self._build_message(to, subject, body), to, message_index)
+
+    def send_reply(
+        self,
+        to: str,
+        body: str,
+        in_reply_to: str,
+        references: str,
+        subject: str,
+        message_index: int = 2,
+    ) -> SendResult:
+        """Send a body-only reply threaded onto an existing conversation.
+
+        `in_reply_to` / `references` come from the message being replied to, so
+        Gmail shows this inside that thread. `subject` should already carry the
+        "Re: " prefix.
+        """
+        to = to.strip()
+        if not EMAIL_PATTERN.match(to):
+            return SendResult(
+                email=to, success=False, message_index=message_index, error="Invalid recipient address"
+            )
+        message = self._build_message(
+            to, subject, body, in_reply_to=in_reply_to, references=references
+        )
+        return self._deliver(message, to, message_index)
 
 
 def build_client(credentials: Credentials) -> GmailClient:

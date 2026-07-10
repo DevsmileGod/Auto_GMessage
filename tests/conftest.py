@@ -3,6 +3,7 @@
 import sys
 import threading
 import tkinter as tk
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from gmail_client import SendResult  # noqa: E402
+from imap_client import DetectedReply  # noqa: E402
+from sender import CampaignCallbacks  # noqa: E402
 
 
 @pytest.fixture(scope="session")
@@ -28,13 +31,26 @@ def tk_root():
     root.destroy()
 
 
-class FakeGmailClient:
-    """Records every send instead of touching the network."""
+@dataclass
+class SentRecord:
+    kind: str  # "first" or "reply"
+    to: str
+    subject: str
+    body: str
+    message_index: int
+    in_reply_to: str = ""
+    references: str = ""
 
-    def __init__(self, fail_on: set[tuple[str, int]] | None = None):
-        self.sent: list[tuple[str, int]] = []
-        self.fail_on = fail_on or set()
+
+class FakeGmailClient:
+    """Records sends instead of touching the network."""
+
+    def __init__(self, fail_first=None, fail_reply=None):
+        self.records: list[SentRecord] = []
+        self.fail_first = {e.lower() for e in (fail_first or [])}
+        self.fail_reply = {e.lower() for e in (fail_reply or [])}
         self.email = "sender@gmail.com"
+        self._n = 0
         self._lock = threading.Lock()
 
     def is_logged_in(self) -> bool:
@@ -43,37 +59,83 @@ class FakeGmailClient:
     def close(self) -> None:
         pass
 
-    def send_email(self, to: str, subject: str, body: str, message_index: int = 1) -> SendResult:
+    def send_email(self, to, subject, body, message_index=1) -> SendResult:
         with self._lock:
-            self.sent.append((to, message_index))
-        if (to, message_index) in self.fail_on:
-            return SendResult(
-                email=to, success=False, message_index=message_index, error="simulated failure"
+            self._n += 1
+            n = self._n
+            self.records.append(SentRecord("first", to, subject, body, message_index))
+        if to.lower() in self.fail_first:
+            return SendResult(email=to, success=False, message_index=message_index, error="fail")
+        return SendResult(email=to, success=True, message_index=message_index, message_id=f"<first-{n}@x>")
+
+    def send_reply(self, to, body, in_reply_to, references, subject, message_index=2) -> SendResult:
+        with self._lock:
+            self._n += 1
+            n = self._n
+            self.records.append(
+                SentRecord("reply", to, subject, body, message_index, in_reply_to, references)
             )
-        return SendResult(
-            email=to, success=True, message_index=message_index, message_id=f"<{to}-{message_index}>"
+        if to.lower() in self.fail_reply:
+            return SendResult(email=to, success=False, message_index=message_index, error="fail")
+        return SendResult(email=to, success=True, message_index=message_index, message_id=f"<reply-{n}@x>")
+
+    def firsts(self) -> list[SentRecord]:
+        return [r for r in self.records if r.kind == "first"]
+
+    def replies(self) -> list[SentRecord]:
+        return [r for r in self.records if r.kind == "reply"]
+
+
+class FakeInbox:
+    """Returns scripted replies for pending recipients."""
+
+    def __init__(self):
+        self._scripted: dict[str, DetectedReply] = {}
+        self.calls = 0
+        self.closed = False
+
+    def add_reply(self, email, reply_message_id="<their-reply@x>", references="", subject="Re: Hello"):
+        self._scripted[email.lower()] = DetectedReply(
+            email=email, reply_message_id=reply_message_id,
+            reply_references=references, reply_subject=subject,
         )
 
+    def find_replies(self, pending) -> list[DetectedReply]:
+        self.calls += 1
+        return [self._scripted[key] for key in list(pending.keys()) if key in self._scripted]
 
-@pytest.fixture
-def no_sleep(monkeypatch):
-    """Make interval waits instant while recording how long each one would have been."""
-    import sender
-
-    waits: list[int] = []
-
-    def fake_sleep_interval(self) -> None:
-        if self._stop_requested:
-            return
-        waits.append(self.interval_seconds)
-
-    monkeypatch.setattr(sender.EmailSender, "_sleep_interval", fake_sleep_interval)
-    return waits
+    def close(self) -> None:
+        self.closed = True
 
 
-def run_to_completion(email_sender, timeout: float = 5.0) -> None:
-    """Block until the background send thread finishes."""
-    thread = email_sender._thread
-    assert thread is not None, "send thread was never started"
-    thread.join(timeout=timeout)
-    assert not thread.is_alive(), "send thread did not finish in time"
+@dataclass
+class Collector:
+    """Captures campaign events and signals completion."""
+
+    firsts: list = field(default_factory=list)      # (SendResult, cursor, total)
+    waited: list = field(default_factory=list)      # (seconds, contacted, total)
+    replies_detected: list = field(default_factory=list)  # email
+    seconds: list = field(default_factory=list)     # SendResult
+    stopped: list = field(default_factory=list)     # bool
+    done: threading.Event = field(default_factory=threading.Event)
+
+    def callbacks(self) -> CampaignCallbacks:
+        return CampaignCallbacks(
+            on_first_result=lambda r, c, t: self.firsts.append((r, c, t)),
+            on_waiting=lambda s, c, t: self.waited.append((s, c, t)),
+            on_reply_detected=lambda e: self.replies_detected.append(e),
+            on_second_result=lambda r: self.seconds.append(r),
+            on_complete=self._complete,
+        )
+
+    def _complete(self, stopped: bool) -> None:
+        self.stopped.append(stopped)
+        self.done.set()
+
+
+def run_campaign(campaign, collector, timeout=10) -> None:
+    """Start a campaign (recipients come from its state) and block until it completes."""
+    assert campaign.start(collector.callbacks()), "campaign refused to start"
+    assert collector.done.wait(timeout=timeout), "campaign never completed"
+    if campaign._thread is not None:
+        campaign._thread.join(timeout=5)

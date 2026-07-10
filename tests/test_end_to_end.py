@@ -1,8 +1,7 @@
-"""End-to-end: the real send loop, the real SMTP client, a real SMTP server.
+"""End-to-end: real Campaign + real SMTP client + real in-process SMTP server.
 
-Nothing is mocked below the socket. These tests answer the question "will the
-first message go out, and will the second one follow after the interval, to the
-same recipient, before we move on?"
+Replies come from a scripted fake inbox (a live IMAP server isn't practical in a
+test); everything from the Campaign down to the SMTP socket is real.
 """
 
 import threading
@@ -10,20 +9,19 @@ import time
 import tkinter as tk
 
 import pytest
+from conftest import Collector, FakeInbox, run_campaign
 from smtp_server import Mailbox, SMTPTestServer
 
+import campaign_state
+import message_store
 import ui
-from exceptions import AuthenticationError
+from campaign_state import CampaignState
 from gmail_client import Credentials, GmailClient
-from sender import EmailSender, Message
+from message_store import MessageStore
+from sender import Campaign, CampaignCallbacks
 
 ALICE = "alice@example.com"
 BOB = "bob@example.com"
-
-MESSAGES = [
-    Message(subject="Intro", body="Hello, this is the first message."),
-    Message(subject="Follow up", body="Hello again, this is the second message."),
-]
 
 
 @pytest.fixture
@@ -39,276 +37,158 @@ def server(mailbox):
 
 @pytest.fixture
 def client(server, mailbox):
-    credentials = Credentials(email=mailbox.username, app_password=mailbox.password)
-    client = GmailClient(credentials, host=server.host, port=server.port, use_starttls=False)
-    client.verify_login()
-    yield client
-    client.close()
+    creds = Credentials(email=mailbox.username, app_password=mailbox.password)
+    c = GmailClient(creds, host=server.host, port=server.port, use_starttls=False)
+    c.verify_login()
+    yield c
+    c.close()
 
 
-def run_send(email_sender, emails, interval=0, timeout=30):
-    """Run a full send and block until it completes."""
-    email_sender.interval_seconds = interval
-    done = threading.Event()
-    completion = {}
-
-    def on_complete(stopped, results, retryable):
-        completion.update(stopped=stopped, results=results, retryable=retryable)
-        done.set()
-
-    assert email_sender.start(emails=emails, messages=MESSAGES, on_complete=on_complete)
-    assert done.wait(timeout=timeout), "send never completed"
-    email_sender._thread.join(timeout=5)
-    return completion
+def build(tmp_path, emails):
+    store = MessageStore(tmp_path / "messages.json")
+    store.add_first("Intro A", "Hello, this is intro A.")
+    store.add_first("Intro B", "Hello, this is intro B.")
+    store.set_second("Thanks for getting back to me!")
+    state = CampaignState(tmp_path / "state.json")
+    state.add_emails(emails)
+    state.begin()
+    return store, state
 
 
-# ---------------------------------------------------------------- happy path
+# --------------------------------------------------------------- outreach
 
 
-def test_one_recipient_receives_both_messages_in_order(client, mailbox):
-    email_sender = EmailSender(client)
-    completion = run_send(email_sender, [ALICE])
+def test_distinct_first_messages_on_the_wire(client, tmp_path, mailbox):
+    store, state = build(tmp_path, [ALICE, BOB])
+    inbox = FakeInbox()
+    inbox.add_reply(ALICE)
+    inbox.add_reply(BOB)
+    campaign = Campaign(client, store, inbox, state, interval_seconds=0, poll_interval_seconds=0)
 
-    assert len(mailbox.emails) == 2
-    first, second = mailbox.emails
+    run_campaign(campaign, Collector())
 
-    assert first.to == ALICE and second.to == ALICE
-    assert first.subject == "Intro"
-    assert second.subject == "Follow up"
-    assert first.body == "Hello, this is the first message."
-    assert second.body == "Hello again, this is the second message."
-    assert completion["stopped"] is False
-    assert completion["retryable"] == []
-
-
-def test_envelope_sender_and_recipient_are_correct(client, mailbox):
-    EmailSender(client)
-    run_send(EmailSender(client), [ALICE])
-
-    for received in mailbox.emails:
-        assert received.mail_from == mailbox.username
-        assert received.rcpt_to == [ALICE]
-        assert received.parsed["From"] == mailbox.username
+    firsts = {e.to: e for e in mailbox.emails if not e.parsed["In-Reply-To"]}
+    assert firsts[ALICE].subject == "Intro A"
+    assert firsts[BOB].subject == "Intro B"
+    assert firsts[ALICE].body == "Hello, this is intro A."
 
 
-def test_second_message_arrives_only_after_the_interval(client, mailbox):
-    email_sender = EmailSender(client)
-    run_send(email_sender, [ALICE], interval=2)
-
-    assert len(mailbox.emails) == 2
-    gap = mailbox.emails[1].received_at - mailbox.emails[0].received_at
-    assert gap >= 2.0, f"follow-up arrived after only {gap:.2f}s"
+# --------------------------------------------------------------- follow-up
 
 
-def test_recipients_are_processed_one_at_a_time(client, mailbox):
-    """Both of Alice's messages must land before Bob hears anything."""
-    email_sender = EmailSender(client)
-    run_send(email_sender, [ALICE, BOB], interval=1)
+def test_reply_produces_threaded_body_only_follow_up(client, tmp_path, mailbox):
+    store, state = build(tmp_path, [ALICE])
+    inbox = FakeInbox()
+    inbox.add_reply(ALICE, reply_message_id="<a-reply@mail>", references="<orig@x>", subject="Re: Intro A")
+    campaign = Campaign(client, store, inbox, state, interval_seconds=0, poll_interval_seconds=0)
 
-    order = [(e.to, e.subject) for e in mailbox.emails]
-    assert order == [
-        (ALICE, "Intro"),
-        (ALICE, "Follow up"),
-        (BOB, "Intro"),
-        (BOB, "Follow up"),
-    ]
+    run_campaign(campaign, Collector())
 
-
-def test_interval_separates_every_message_including_across_recipients(client, mailbox):
-    email_sender = EmailSender(client)
-    run_send(email_sender, [ALICE, BOB], interval=1)
-
-    times = [e.received_at for e in mailbox.emails]
-    gaps = [b - a for a, b in zip(times, times[1:])]
-    assert all(gap >= 1.0 for gap in gaps), gaps
+    followups = [e for e in mailbox.emails if e.parsed["In-Reply-To"]]
+    assert len(followups) == 1
+    reply = followups[0].parsed
+    assert reply["To"] == ALICE
+    assert reply["Subject"] == "Re: Intro A"
+    assert reply["In-Reply-To"] == "<a-reply@mail>"
+    assert "<a-reply@mail>" in reply["References"]
+    assert followups[0].body == "Thanks for getting back to me!"
 
 
-def test_each_message_gets_a_unique_message_id(client, mailbox):
-    run_send(EmailSender(client), [ALICE, BOB])
+def test_resume_after_restart_contacts_remaining_and_answers_earlier_batch(client, tmp_path, mailbox):
+    """Two messages, three recipients: batch, 'restart', unlock, resume."""
+    store = MessageStore(tmp_path / "messages.json")
+    store.add_first("M1", "Body 1")
+    store.add_first("M2", "Body 2")
+    store.set_second("Follow-up")
+    state = CampaignState(tmp_path / "state.json")
+    state.add_emails([ALICE, BOB, "carol@example.com"])
+    state.begin()
 
-    ids = [e.parsed["Message-ID"] for e in mailbox.emails]
-    assert all(ids), "every message needs a Message-ID"
-    assert len(set(ids)) == len(ids), "Message-IDs must be unique"
-    assert all(i.endswith("@gmail.com>") for i in ids), ids
+    # First run: contact two, then park on the exhausted pool.
+    c1 = Campaign(client, store, FakeInbox(), state, interval_seconds=0, poll_interval_seconds=0)
+    done1 = threading.Event()
+    c1.start(CampaignCallbacks(on_waiting=lambda *_: c1.stop(), on_complete=lambda s: done1.set()))
+    assert done1.wait(timeout=10)
+    c1._thread.join(timeout=5)
+    assert state.cursor == 2
+    first_batch = [e.to for e in mailbox.emails if not e.parsed["In-Reply-To"]]
+    assert first_batch == [ALICE, BOB]
 
+    # Restart: reload from disk, 24h elapsed (unlock), everyone replies.
+    store.reset_cooldowns()
+    store2 = MessageStore(tmp_path / "messages.json")
+    state2 = CampaignState(tmp_path / "state.json")
+    inbox2 = FakeInbox()
+    for e in (ALICE, BOB, "carol@example.com"):
+        inbox2.add_reply(e)
+    c2 = Campaign(client, store2, inbox2, state2, interval_seconds=0, poll_interval_seconds=0)
+    run_campaign(c2, Collector())
 
-def test_unicode_subject_and_body_survive_the_round_trip(client, mailbox):
-    email_sender = EmailSender(client)
-    messages = [
-        Message(subject="Grüße 👋", body="Здравствуйте — first"),
-        Message(subject="日本語", body="こんにちは — second"),
-    ]
-    done = threading.Event()
-    email_sender.interval_seconds = 0
-    email_sender.start(emails=[ALICE], messages=messages, on_complete=lambda *_: done.set())
-    assert done.wait(timeout=15)
-    email_sender._thread.join(timeout=5)
-
-    assert mailbox.emails[0].subject == "Grüße 👋"
-    assert mailbox.emails[1].subject == "日本語"
-    assert mailbox.emails[0].body == "Здравствуйте — first"
-    assert mailbox.emails[1].body == "こんにちは — second"
-
-
-# ------------------------------------------------------------------ failures
-
-
-def test_rejected_recipient_never_receives_the_follow_up(client, mailbox):
-    mailbox.reject_recipients.add(ALICE)
-    email_sender = EmailSender(client)
-
-    completion = run_send(email_sender, [ALICE, BOB])
-
-    delivered = [(e.to, e.subject) for e in mailbox.emails]
-    assert delivered == [(BOB, "Intro"), (BOB, "Follow up")]
-    assert completion["retryable"] == [ALICE]
-    assert email_sender.pending_messages(ALICE) == [1, 2]
+    all_firsts = [e.to for e in mailbox.emails if not e.parsed["In-Reply-To"]]
+    replies = {e.to for e in mailbox.emails if e.parsed["In-Reply-To"]}
+    assert all_firsts == [ALICE, BOB, "carol@example.com"]  # carol contacted after resume
+    assert replies == {ALICE, BOB, "carol@example.com"}     # earlier batch answered too
+    assert state2.is_finished()
 
 
-def test_retry_delivers_only_the_missing_message_no_duplicates(client, mailbox):
-    """Message 1 lands, message 2 is refused, retry must not resend message 1."""
-    email_sender = EmailSender(client)
-
-    # Fail only the second message by rejecting the recipient partway through.
-    original_send = client.send_email
-    calls = {"n": 0}
-
-    def send_email(to, subject, body, message_index=1):
-        calls["n"] += 1
-        if calls["n"] == 2:
-            mailbox.reject_recipients.add(to)
-        try:
-            return original_send(to, subject, body, message_index)
-        finally:
-            mailbox.reject_recipients.discard(to)
-
-    client.send_email = send_email
-    completion = run_send(email_sender, [ALICE])
-
-    assert [e.subject for e in mailbox.emails] == ["Intro"]
-    assert completion["retryable"] == [ALICE]
-    assert email_sender.pending_messages(ALICE) == [2]
-
-    client.send_email = original_send
-    done = threading.Event()
-    email_sender.interval_seconds = 0
-    email_sender.start_retry(
-        emails=[ALICE], messages=MESSAGES, on_complete=lambda *_: done.set()
-    )
-    assert done.wait(timeout=15)
-    email_sender._thread.join(timeout=5)
-
-    subjects = [e.subject for e in mailbox.emails]
-    assert subjects == ["Intro", "Follow up"], "retry must not deliver 'Intro' twice"
-    assert email_sender.pending_messages(ALICE) == []
+# ------------------------------------------------------ the whole app, live
 
 
-def test_wrong_app_password_is_rejected_at_sign_in(server, mailbox):
-    credentials = Credentials(email=mailbox.username, app_password="wrongpassword123")
-    client = GmailClient(credentials, host=server.host, port=server.port, use_starttls=False)
-
-    with pytest.raises(AuthenticationError, match="App Password"):
-        client.verify_login()
-
-
-def test_server_restart_mid_run_does_not_lose_the_follow_up(client, mailbox):
-    """Gmail hangs up on idle connections; the client must silently reconnect."""
-    email_sender = EmailSender(client)
-    email_sender.interval_seconds = 0
-
-    assert client.send_email(ALICE, "Intro", "one", 1).success
-    client._smtp.close()  # simulate the server dropping the idle socket
-    assert client.send_email(ALICE, "Follow up", "two", 2).success
-
-    assert [e.subject for e in mailbox.emails] == ["Intro", "Follow up"]
-
-
-def test_stop_mid_run_leaves_the_second_message_unsent(client, mailbox):
-    email_sender = EmailSender(client)
-    email_sender.interval_seconds = 5
-    done = threading.Event()
-
-    email_sender.start(
-        emails=[ALICE],
-        messages=MESSAGES,
-        on_result=lambda *_: email_sender.stop(),
-        on_complete=lambda *_: done.set(),
-    )
-    assert done.wait(timeout=15)
-    email_sender._thread.join(timeout=5)
-
-    assert [e.subject for e in mailbox.emails] == ["Intro"]
-
-
-# ----------------------------------------------------- the whole app, for real
-
-
-def test_full_app_flow_paste_import_send_two_messages(
+def test_full_app_campaign_import_start_and_autoreply(
     tk_root, tmp_path, monkeypatch, server, mailbox, client
 ):
-    """Drive the actual GUI: paste addresses, import, click Send.
-
-    Covers the reported bug (paste box locking up) and the requested behaviour
-    (two messages per recipient, one recipient at a time) in one pass.
-    """
     monkeypatch.setattr(ui, "CONFIG_PATH", tmp_path / "config.json")
-    monkeypatch.setattr(ui, "TEMPLATES_PATH", tmp_path / "templates.json")
     monkeypatch.setattr(ui, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(message_store, "MESSAGES_PATH", tmp_path / "messages.json")
+    monkeypatch.setattr(campaign_state, "STATE_PATH", tmp_path / "state.json")
     monkeypatch.setattr(ui, "load_credentials", lambda: None)
-    monkeypatch.setattr(ui.messagebox, "showinfo", lambda *a, **k: None)
-    monkeypatch.setattr(ui.messagebox, "showwarning", lambda *a, **k: None)
-    monkeypatch.setattr(ui.messagebox, "showerror", lambda *a, **k: None)
-    monkeypatch.setattr(ui.messagebox, "askyesno", lambda *a, **k: True)  # confirm the send
+    for name in ("showinfo", "showwarning", "showerror"):
+        monkeypatch.setattr(ui.messagebox, name, lambda *a, **k: None)
+    monkeypatch.setattr(ui.messagebox, "askyesno", lambda *a, **k: True)
+
+    inbox = FakeInbox()
+    inbox.add_reply(ALICE, subject="Re: Intro A")
+    inbox.add_reply(BOB, subject="Re: Intro B")
 
     window = tk.Toplevel(tk_root)
     window.withdraw()
     app = ui.GmailAutoSenderApp(root=window)
     try:
-        # Sign in with the client pointed at our local server.
         app._client = client
-        app._email_sender = EmailSender(client)
-        app.config["interval_seconds"] = 1
+        app._inbox = inbox
+        app._store.add_first("Intro A", "Hello A")
+        app._store.add_first("Intro B", "Hello B")
+        app._store.set_second("Thanks for replying!")
+        app._refresh_first_list()
+        app.config["interval_seconds"] = 0
+        app.config["poll_interval_seconds"] = 0
 
-        # Type two addresses and press Import.
         app.paste_text.insert("1.0", f"{ALICE}\n{BOB}\n")
         app._import_recipients_from_paste()
-        assert app._get_recipient_emails() == [ALICE, BOB]
-        assert str(app.paste_text.cget("state")) == tk.NORMAL
-
-        app._editors[0].set_message("Intro", "Hello, this is the first message.")
-        app._editors[1].set_message("Follow up", "Hello again, this is the second message.")
+        assert sorted(app._get_recipient_emails()) == [ALICE, BOB]
 
         app.start()
-        assert app._email_sender.is_running
-        assert str(app.paste_text.cget("state")) == tk.DISABLED  # locked during the send
+        assert app._campaign is not None
+        assert str(app.paste_text.cget("state")) == tk.DISABLED
 
-        deadline = time.monotonic() + 60
-        while app._email_sender.is_running and time.monotonic() < deadline:
+        deadline = time.monotonic() + 30
+        while app._campaign.is_running and time.monotonic() < deadline:
             window.update()
-            time.sleep(0.05)
-        assert not app._email_sender.is_running, "send did not finish"
+            time.sleep(0.02)
+        assert not app._campaign.is_running, "campaign did not finish"
         window.update()
-        app._pump()  # drain whatever the worker queued at the very end
+        app._pump()
 
-        # Four emails: both of Alice's, then both of Bob's.
-        assert [(e.to, e.subject) for e in mailbox.emails] == [
-            (ALICE, "Intro"),
-            (ALICE, "Follow up"),
-            (BOB, "Intro"),
-            (BOB, "Follow up"),
-        ]
-        times = [e.received_at for e in mailbox.emails]
-        assert all(b - a >= 1.0 for a, b in zip(times, times[1:]))
+        firsts = [e for e in mailbox.emails if not e.parsed["In-Reply-To"]]
+        replies = [e for e in mailbox.emails if e.parsed["In-Reply-To"]]
+        assert {e.to for e in firsts} == {ALICE, BOB}
+        assert {e.to for e in replies} == {ALICE, BOB}
 
-        # Every recipient shows as fully sent, and the paste box works again.
         for email in (ALICE, BOB):
-            assert app._recipient_records[email]["status"] == ui.STATUS_SENT
-            assert app._recipient_records[email]["sent"] is True
+            assert app._state.get(email).status == campaign_state.STATUS_DONE
         assert str(app.paste_text.cget("state")) == tk.NORMAL
-
-        app.paste_text.insert("1.0", "carol@example.com")
-        assert app.paste_text.get("1.0", tk.END).strip() == "carol@example.com"
     finally:
-        app._client = None  # the client fixture owns closing it
+        app._client = None
+        app._inbox = None
         app._closing = True
         window.destroy()

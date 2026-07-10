@@ -3,6 +3,10 @@
 gmail_credentials.json
 .env
 
+# Per-user runtime data (contains recipient emails, message content, progress)
+campaign_state.json
+messages.json
+
 # Python cache
 __pycache__/
 *.pyc

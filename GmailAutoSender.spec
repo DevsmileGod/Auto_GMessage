@@ -8,7 +8,10 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=["paths", "gmail_client", "sender", "ui", "exceptions"],
+    hiddenimports=[
+        "paths", "gmail_client", "imap_client", "message_store",
+        "campaign_state", "sender", "ui", "exceptions",
+    ],
     hookspath=[],
     runtime_hooks=[],
     # Trim large libraries the app never touches to keep the exe small.
