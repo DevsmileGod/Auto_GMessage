@@ -1,9 +1,10 @@
 """Watch a Gmail inbox over IMAP and detect replies to messages we sent.
 
 SMTP can only send, so detecting whether a recipient replied requires reading the
-mailbox. This connects to imap.gmail.com with the same App Password and, given the
-first messages we sent, finds which recipients have replied — matching primarily on
-the threading headers (In-Reply-To / References) and falling back to sender+subject.
+mailbox. This connects to imap.gmail.com with the same credentials used for sending —
+OAuth via XOAUTH2, or the App Password — and, given the first messages we sent, finds
+which recipients have replied, matching primarily on the threading headers
+(In-Reply-To / References) and falling back to sender+subject.
 """
 
 import email
@@ -27,6 +28,12 @@ IMAP_HELP = (
     "Gmail refused the IMAP connection. Two things to check:\n\n"
     "1. IMAP must be ON: Gmail → Settings → Forwarding and POP/IMAP → Enable IMAP.\n"
     "2. Use the same 16-character App Password you signed in with."
+)
+
+IMAP_OAUTH_HELP = (
+    "Gmail refused the IMAP connection for this Google account.\n\n"
+    "IMAP must be ON: Gmail → Settings → Forwarding and POP/IMAP → Enable IMAP.\n"
+    "If it already is, sign in with Google again to refresh the authorisation."
 )
 
 _RE_PREFIX = re.compile(r"^\s*re\s*:\s*", re.IGNORECASE)
@@ -77,17 +84,32 @@ class GmailInbox:
         except (OSError, imaplib.IMAP4.error) as exc:
             raise AuthenticationError(f"Could not reach {self._host}:{self._port} — {exc}") from exc
         try:
-            imap.login(self._credentials.email, self._credentials.app_password)
+            if self._credentials.uses_oauth:
+                # imaplib base64-encodes whatever the authobject returns; the argument
+                # it passes in is the (empty) server challenge, which XOAUTH2 ignores.
+                imap.authenticate("XOAUTH2", lambda _challenge: self._credentials.xoauth2().encode())
+            else:
+                imap.login(self._credentials.email, self._credentials.app_password)
             imap.select("INBOX")
+        except AuthenticationError:
+            # Raised while minting the OAuth token; it explains itself.
+            self._logout(imap)
+            raise
         except imaplib.IMAP4.error as exc:
-            try:
-                imap.logout()
-            except (OSError, imaplib.IMAP4.error):
-                pass
+            self._logout(imap)
             logger.error("IMAP login/select failed for %s: %s", self._credentials.email, exc)
-            raise AuthenticationError(IMAP_HELP) from exc
+            raise AuthenticationError(
+                IMAP_OAUTH_HELP if self._credentials.uses_oauth else IMAP_HELP
+            ) from exc
         logger.info("IMAP connected as %s", self._credentials.email)
         return imap
+
+    @staticmethod
+    def _logout(imap: imaplib.IMAP4) -> None:
+        try:
+            imap.logout()
+        except (OSError, imaplib.IMAP4.error):
+            pass
 
     def _ensure(self) -> imaplib.IMAP4:
         if self._imap is not None:

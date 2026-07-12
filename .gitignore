@@ -1,6 +1,7 @@
 
 # Ignore credentials containing sensitive keys
 gmail_credentials.json
+client_secret.json
 .env
 
 # Per-user runtime data (contains recipient emails, message content, progress)

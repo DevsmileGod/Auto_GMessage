@@ -1,18 +1,22 @@
-"""Gmail SMTP client using an account password or app password."""
+"""Gmail SMTP client, authenticating with either Google OAuth or an App Password."""
 
 import json
 import logging
 import re
 import smtplib
 import ssl
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, field
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 from pathlib import Path
 from typing import Optional
 
+import google_auth
 import paths
+import secret_store
 from exceptions import AuthenticationError, ConfigurationError
+from google_auth import OAuthToken
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +33,15 @@ APP_PASSWORD_HELP = (
     "1. Turn on 2-Step Verification at myaccount.google.com/security\n"
     "2. Go to myaccount.google.com/apppasswords\n"
     "3. Create a password and paste it here (spaces are fine)."
+)
+
+OAUTH_EXPIRED_HELP = (
+    "Google rejected the saved sign-in. This usually means access was revoked, or the "
+    "OAuth consent screen is still in 'Testing' mode — Google expires those refresh "
+    "tokens after 7 days.\n\n"
+    "Click 'Sign in with Google' again. To stop it recurring, publish the consent "
+    "screen in the Google Cloud Console (APIs & Services → OAuth consent screen → "
+    "Publish app)."
 )
 
 _RE_PREFIX = re.compile(r"^\s*re\s*:\s*", re.IGNORECASE)
@@ -49,16 +62,45 @@ def build_references(original_references: str, replied_message_id: str) -> str:
 
 @dataclass
 class Credentials:
-    """Gmail SMTP login details."""
+    """How to authenticate to Gmail: an OAuth token, or an App Password.
+
+    Exactly one of the two is set. OAuth is the comfortable path — the user clicks a
+    button once and this object silently mints a new access token whenever the old one
+    lapses. The App Password path remains for accounts that cannot use OAuth.
+    """
 
     email: str
-    app_password: str
+    app_password: str = ""
+    oauth: Optional[OAuthToken] = None
+    # SMTP sends and IMAP reply-polling run on different threads and share these
+    # credentials, so two of them can find the access token expired at the same moment.
+    # Refreshing under a lock means the second one waits and reuses the first's token
+    # instead of spending the refresh twice.
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+
+    @property
+    def uses_oauth(self) -> bool:
+        return self.oauth is not None
 
     def validate(self) -> None:
         if not EMAIL_PATTERN.match(self.email):
             raise ConfigurationError(f"'{self.email}' is not a valid email address.")
-        if not self.app_password:
+        if not self.uses_oauth and not self.app_password:
             raise ConfigurationError("App password is required.")
+
+    def access_token(self) -> str:
+        """A live OAuth access token, refreshed if the cached one has expired."""
+        if self.oauth is None:
+            raise ConfigurationError("These credentials do not use Google sign-in.")
+        with self._lock:
+            if self.oauth.is_expired():
+                config = google_auth.load_client_config()
+                google_auth.refresh_access_token(config, self.oauth)
+            return self.oauth.access_token
+
+    def xoauth2(self) -> str:
+        """The SASL XOAUTH2 initial response for SMTP/IMAP."""
+        return google_auth.xoauth2_string(self.email, self.access_token())
 
 
 def normalize_app_password(password: str) -> str:
@@ -67,25 +109,40 @@ def normalize_app_password(password: str) -> str:
 
 
 def load_credentials() -> Optional[Credentials]:
-    """Read saved credentials, or None if absent/unreadable."""
+    """Read saved credentials, or None if absent/unreadable/undecryptable."""
     if not CREDENTIALS_PATH.exists():
         return None
     try:
         with CREDENTIALS_PATH.open(encoding="utf-8") as f:
             data = json.load(f)
-        email = (data.get("email") or "").strip()
-        password = normalize_app_password(data.get("app_password") or "")
-        if not email or not password:
-            return None
-        return Credentials(email=email, app_password=password)
     except (OSError, json.JSONDecodeError) as exc:
         logger.warning("Could not read %s: %s", CREDENTIALS_PATH, exc)
         return None
 
+    email = (data.get("email") or "").strip()
+    if not email:
+        return None
+
+    oauth_data = data.get("oauth") or {}
+    refresh_token = secret_store.unprotect(oauth_data.get("refresh_token") or "")
+    if refresh_token:
+        return Credentials(email=email, oauth=OAuthToken(refresh_token=refresh_token))
+
+    password = normalize_app_password(secret_store.unprotect(data.get("app_password") or ""))
+    if not password:
+        return None
+    return Credentials(email=email, app_password=password)
+
 
 def save_credentials(credentials: Credentials) -> None:
-    """Persist credentials to a gitignored file."""
-    payload = {"email": credentials.email, "app_password": credentials.app_password}
+    """Persist credentials, with the secret encrypted at rest, to a gitignored file."""
+    payload: dict = {"email": credentials.email}
+    if credentials.oauth is not None:
+        payload["oauth"] = {
+            "refresh_token": secret_store.protect(credentials.oauth.refresh_token)
+        }
+    else:
+        payload["app_password"] = secret_store.protect(credentials.app_password)
     try:
         with CREDENTIALS_PATH.open("w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
@@ -163,11 +220,18 @@ class GmailClient:
             raise AuthenticationError(f"Could not reach {self._host}:{self._port} — {exc}") from exc
 
         try:
-            smtp.login(self._credentials.email, self._credentials.app_password)
+            self._authenticate(smtp)
+        except AuthenticationError:
+            # Raised while minting the OAuth token, before Gmail was even asked.
+            # Already carries its own explanation — just don't leak the socket.
+            smtp.close()
+            raise
         except smtplib.SMTPAuthenticationError as exc:
             smtp.close()
             logger.error("Gmail authentication failed for %s", self._credentials.email)
-            raise AuthenticationError(APP_PASSWORD_HELP) from exc
+            raise AuthenticationError(
+                OAUTH_EXPIRED_HELP if self._credentials.uses_oauth else APP_PASSWORD_HELP
+            ) from exc
         except smtplib.SMTPException as exc:
             smtp.close()
             raise AuthenticationError(f"Gmail login failed: {exc}") from exc
@@ -175,6 +239,19 @@ class GmailClient:
         self._authenticated = True
         logger.info("Connected to Gmail SMTP as %s", self._credentials.email)
         return smtp
+
+    def _authenticate(self, smtp: smtplib.SMTP) -> None:
+        """Log in with OAuth if we have it, else with the App Password."""
+        if self._credentials.uses_oauth:
+            # Gmail wants the XOAUTH2 token in the AUTH command itself; smtplib
+            # base64-encodes whatever the authobject returns.
+            smtp.auth(
+                "XOAUTH2",
+                lambda challenge=None: self._credentials.xoauth2(),
+                initial_response_ok=True,
+            )
+        else:
+            smtp.login(self._credentials.email, self._credentials.app_password)
 
     def _ensure_connection(self) -> smtplib.SMTP:
         """Return a live connection, reconnecting if the old one went stale."""
