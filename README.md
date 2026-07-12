@@ -8,7 +8,7 @@
 
 A desktop app that runs a two-phase Gmail outreach campaign: it sends a **unique first message** to each recipient, then **watches your inbox and auto-replies** to anyone who responds.
 
-Sign-in uses your Gmail address and a Google **App Password** — no OAuth, no Google Cloud project, no `credentials.json`. Sending goes over SMTP; reply detection over IMAP.
+Sign in with one click via **Sign in with Google** (OAuth), or with a classic **App Password**. Sending goes over SMTP; reply detection over IMAP. Either way the saved secret is encrypted at rest with Windows DPAPI.
 
 ## How a campaign works
 
@@ -33,14 +33,30 @@ No two recipients receive the same text, and **a sent message is locked for 24 h
 
 ## Setup
 
-You need a 16-character **App Password** and **IMAP** enabled:
+**Enable IMAP first, whichever sign-in you use:** Gmail → **Settings → Forwarding and POP/IMAP → Enable IMAP**. *(Without it, outreach still works but replies can't be detected.)*
+
+Then pick a sign-in method.
+
+### Sign in with Google (recommended)
+
+Click the button, pick your account in the browser, done — nothing to copy, and it stays signed in. Google requires every app to identify itself with its own OAuth client, so there is a **one-time setup** to create yours:
+
+1. Create a project at [console.cloud.google.com](https://console.cloud.google.com).
+2. **APIs & Services → OAuth consent screen** → *External* → add your own Gmail address under **Test users**.
+3. **APIs & Services → Credentials → Create credentials → OAuth client ID** → Application type: **Desktop app**.
+4. Download the JSON and save it beside the app as **`client_secret.json`**.
+
+Now **Sign in with Google** works. The app never sees your Google password.
+
+> **Publish the consent screen** (*OAuth consent screen → Publish app*) once it works. While it stays in *Testing*, Google expires the saved authorisation after **7 days** and you'll have to click sign-in again. Publishing an app using the `mail.google.com` scope to *outside* users would need Google's security review — but you don't need that here, because you are the only user.
+
+### App Password (fallback)
 
 1. Turn on **2-Step Verification** at [myaccount.google.com/security](https://myaccount.google.com/security).
 2. Create an App Password at [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords).
-3. Enable IMAP: Gmail → **Settings → Forwarding and POP/IMAP → Enable IMAP**. *(Without this, outreach still works but replies can't be detected.)*
-4. Launch the app, click **Sign in**, and paste the password. Spaces are ignored.
+3. Launch the app, click **Sign in**, and paste it in the lower half of the dialog. Spaces are ignored.
 
-With *Remember on this computer* ticked, the address and password are written to `gmail_credentials.json`, which is gitignored. **Sign out** deletes that file.
+With *Remember on this computer* ticked, the login is written to `gmail_credentials.json` (gitignored). The secret inside — refresh token or app password — is **encrypted with Windows DPAPI**, so the file is useless to another Windows user or on another machine. **Sign out** deletes it.
 
 ## Running
 
@@ -65,8 +81,27 @@ The result is a single `dist/GmailAutoSender.exe` (~11 MB).
 
 ## Using it
 
-1. **Sign in** with your Gmail address and App Password.
-2. Build the **first-message pool** (left panel, top): **New** to add a subject + body, **Edit**/**Delete** to manage them. You can have far fewer messages than recipients — they'll drip in daily batches. **Clear locks** removes the 24h cooldowns if you need to reuse messages sooner.
+1. **Sign in** — one click with Google, or with an App Password.
+2. Build the **first-message pool** (left panel, top). Use **Import…** to add many at once; **New** for a single one. **Duplicate** copies a message as an unlocked variant to edit, and **Delete** works on a multi-selection. You can have far fewer messages than recipients — they'll drip in daily batches. **Clear locks** removes the 24h cooldowns if you need to reuse messages sooner.
+
+   **Import…** takes messages three ways:
+
+   - **Paste** them into the box, separated by a line of three dashes. In each one the first line is the subject and the rest is the body — so blank lines inside a body are safe:
+
+     ```text
+     Quick question about your rollout
+     Hi there,
+
+     Saw the announcement and wanted to reach out.
+     ---
+     Following up on your hiring plans
+     Hi there,
+
+     Different message, different subject.
+     ```
+
+   - **Load CSV…** — any CSV with `subject` and `body` columns (a headerless file is read as subject, body).
+   - **Load folder…** — every `.txt`/`.md` file in it becomes one message: first line subject, rest body.
 3. Write the **second (reply) message** (left panel, bottom) — body only — and click **Save reply**.
 4. Paste recipient addresses on the right (one per line, or comma/semicolon separated) and click **Import**. Or **Load CSV** with an `email` column.
 5. Set the outreach interval and the inbox-poll interval under **Settings**.
@@ -85,12 +120,15 @@ The **Status** column moves `Pending → Sending → Sent → Replied → Done` 
 | `sender.py` | The resumable two-phase `Campaign` (batched outreach, then watch-and-reply) |
 | `message_store.py` | First-message pool + 24h locks, second message, persistence |
 | `campaign_state.py` | The resume flag: recipient queue, cursor, per-recipient status |
-| `gmail_client.py` | SMTP: login, sending, threaded replies |
+| `gmail_client.py` | SMTP: login (OAuth or App Password), sending, threaded replies |
 | `imap_client.py` | IMAP: watches the inbox, matches replies to what we sent |
+| `google_auth.py` | "Sign in with Google": OAuth consent flow, token refresh, XOAUTH2 |
+| `secret_store.py` | Encrypts the saved secret at rest (Windows DPAPI) |
 | `config.json` | Interval, poll interval, theme |
 | `messages.json` | First-message pool (with lock timestamps) and the reply message |
 | `campaign_state.json` | Saved campaign progress, so it resumes after a restart |
-| `gmail_credentials.json` | Your saved login (gitignored, created on first sign-in) |
+| `gmail_credentials.json` | Your saved login, secret encrypted (gitignored, created on first sign-in) |
+| `client_secret.json` | Your Google OAuth client, if you use Google sign-in (gitignored, you provide it) |
 | `logs/` | `app.log` plus a per-day session log |
 
 ## Sending limits

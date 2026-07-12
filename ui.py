@@ -5,12 +5,14 @@ import json
 import logging
 import queue
 import re
+import threading
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 import campaign_state
+import google_auth
 import message_store
 import paths
 from campaign_state import CampaignState
@@ -142,89 +144,167 @@ def format_cooldown(seconds: float) -> str:
 
 
 class SignInDialog(tk.Toplevel):
-    """Collect a Gmail address and app password, then verify SMTP (and try IMAP)."""
+    """Sign in to Gmail — one click with Google, or an App Password as a fallback."""
 
     def __init__(self, parent: tk.Misc, initial: Credentials | None = None):
         super().__init__(parent)
         self.title("Sign in to Gmail")
-        self.geometry("460x340")
+        self.geometry("470x430")
         self.resizable(False, False)
         self.transient(parent)
         self.client: GmailClient | None = None
         self.inbox = None
         self.imap_error: str | None = None
+        self._closed = False
 
         frame = ttk.Frame(self, padding=16)
         frame.pack(fill=tk.BOTH, expand=True)
         frame.columnconfigure(0, weight=1)
 
-        ttk.Label(frame, text="Gmail Account", font=("Segoe UI", 11, "bold")).grid(
-            row=0, column=0, sticky=tk.W, pady=(0, 12)
+        ttk.Label(frame, text="Sign in to Gmail", font=("Segoe UI", 11, "bold")).grid(
+            row=0, column=0, sticky=tk.W, pady=(0, 10)
         )
-        ttk.Label(frame, text="Email address:").grid(row=1, column=0, sticky=tk.W, pady=(0, 4))
+
+        self.google_btn = tk.Button(
+            frame, text="Sign in with Google", command=self._google_sign_in,
+            font=("Segoe UI", 10, "bold"), bg="#1a73e8", fg="white",
+            activebackground="#1765cc", activeforeground="white",
+            relief=tk.FLAT, cursor="hand2", pady=8,
+        )
+        self.google_btn.grid(row=1, column=0, sticky=tk.EW)
+        ttk.Label(
+            frame,
+            text="Opens your browser. Nothing to copy or paste, and it stays signed in.",
+            font=("Segoe UI", 8), foreground="#888",
+        ).grid(row=2, column=0, sticky=tk.W, pady=(4, 12))
+
+        separator = ttk.Frame(frame)
+        separator.grid(row=3, column=0, sticky=tk.EW, pady=(0, 12))
+        separator.columnconfigure((0, 2), weight=1)
+        ttk.Separator(separator).grid(row=0, column=0, sticky=tk.EW, pady=6)
+        ttk.Label(separator, text="  or use an App Password  ", font=("Segoe UI", 8),
+                  foreground="#888").grid(row=0, column=1)
+        ttk.Separator(separator).grid(row=0, column=2, sticky=tk.EW, pady=6)
+
+        ttk.Label(frame, text="Email address:").grid(row=4, column=0, sticky=tk.W, pady=(0, 4))
         self.email_var = tk.StringVar(value=initial.email if initial else "")
         email_entry = ttk.Entry(frame, textvariable=self.email_var)
-        email_entry.grid(row=2, column=0, sticky=tk.EW, pady=(0, 10))
+        email_entry.grid(row=5, column=0, sticky=tk.EW, pady=(0, 10))
 
-        ttk.Label(frame, text="App password:").grid(row=3, column=0, sticky=tk.W, pady=(0, 4))
-        self.password_var = tk.StringVar(value=initial.app_password if initial else "")
-        ttk.Entry(frame, textvariable=self.password_var, show="•").grid(
-            row=4, column=0, sticky=tk.EW, pady=(0, 10)
+        ttk.Label(frame, text="App password:").grid(row=6, column=0, sticky=tk.W, pady=(0, 4))
+        self.password_var = tk.StringVar(
+            value=initial.app_password if initial and not initial.uses_oauth else ""
         )
+        password_entry = ttk.Entry(frame, textvariable=self.password_var, show="•")
+        password_entry.grid(row=7, column=0, sticky=tk.EW, pady=(0, 10))
 
         self.remember_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(frame, text="Remember on this computer", variable=self.remember_var).grid(
-            row=5, column=0, sticky=tk.W, pady=(0, 8)
+            row=8, column=0, sticky=tk.W, pady=(0, 8)
         )
 
         ttk.Label(
             frame,
             text=(
-                "Needs a 16-character App Password (myaccount.google.com/apppasswords)\n"
-                "AND IMAP enabled (Gmail → Settings → Forwarding and POP/IMAP)\n"
+                "Either way, IMAP must be ON (Gmail → Settings → Forwarding and POP/IMAP)\n"
                 "so the app can detect replies."
             ),
             font=("Segoe UI", 8), foreground="#888", justify=tk.LEFT,
-        ).grid(row=6, column=0, sticky=tk.W, pady=(0, 10))
+        ).grid(row=9, column=0, sticky=tk.W, pady=(0, 10))
 
         self.status_var = tk.StringVar(value="")
         ttk.Label(frame, textvariable=self.status_var, font=("Segoe UI", 9)).grid(
-            row=7, column=0, sticky=tk.W
+            row=10, column=0, sticky=tk.W
         )
 
         buttons = ttk.Frame(frame)
-        buttons.grid(row=8, column=0, sticky=tk.EW, pady=(12, 0))
-        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side=tk.RIGHT, padx=(6, 0))
+        buttons.grid(row=11, column=0, sticky=tk.EW, pady=(12, 0))
+        self.cancel_btn = ttk.Button(buttons, text="Cancel", command=self.destroy)
+        self.cancel_btn.pack(side=tk.RIGHT, padx=(6, 0))
         self.connect_btn = ttk.Button(buttons, text="Connect", command=self._connect)
         self.connect_btn.pack(side=tk.RIGHT)
 
         self.bind("<Return>", lambda _e: self._connect())
-        email_entry.focus_set()
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        (self.google_btn if not self.email_var.get() else password_entry).focus_set()
         self.grab_set()
         self.wait_window()
+
+    def destroy(self) -> None:
+        # The OAuth worker thread polls back into this window; tell it we are gone.
+        self._closed = True
+        super().destroy()
+
+    def _set_busy(self, busy: bool, status: str = "") -> None:
+        state = tk.DISABLED if busy else tk.NORMAL
+        for button in (self.google_btn, self.connect_btn):
+            button.configure(state=state)
+        self.status_var.set(status)
+        self.update_idletasks()
+
+    # ------------------------------------------------------------------ google
+
+    def _google_sign_in(self) -> None:
+        try:
+            config = google_auth.load_client_config()
+        except ConfigurationError as exc:
+            messagebox.showinfo("Google sign-in — one-time setup", str(exc), parent=self)
+            return
+
+        self._set_busy(True, "Waiting for you to finish in the browser...")
+        result: dict = {}
+
+        def work() -> None:
+            try:
+                email, token = google_auth.sign_in(config)
+                result["credentials"] = Credentials(email=email, oauth=token)
+            except (AuthenticationError, ConfigurationError) as exc:
+                result["error"] = str(exc)
+
+        threading.Thread(target=work, daemon=True).start()
+        self._await_google(result)
+
+    def _await_google(self, result: dict) -> None:
+        """Poll the worker without blocking the Tk event loop (the browser wait is long)."""
+        if self._closed:
+            return
+        if not result:
+            self.after(150, self._await_google, result)
+            return
+        if "error" in result:
+            self._set_busy(False)
+            messagebox.showerror("Google sign-in failed", result["error"], parent=self)
+            return
+        self._finish(result["credentials"])
+
+    # ------------------------------------------------------------ app password
 
     def _connect(self) -> None:
         email = self.email_var.get().strip()
         password = normalize_app_password(self.password_var.get())
         if not email or not password:
-            messagebox.showwarning("Sign in", "Email and app password are required.", parent=self)
+            messagebox.showwarning(
+                "Sign in",
+                "Email and app password are required.\n\n"
+                "Or click 'Sign in with Google' and skip the password entirely.",
+                parent=self,
+            )
             return
+        self._finish(Credentials(email=email, app_password=password))
 
-        self.status_var.set("Connecting to Gmail (SMTP)...")
-        self.connect_btn.configure(state=tk.DISABLED)
-        self.update_idletasks()
+    # ----------------------------------------------------------------- shared
 
-        credentials = Credentials(email=email, app_password=password)
+    def _finish(self, credentials: Credentials) -> None:
+        """Verify the credentials against SMTP (and IMAP), save them, and close."""
+        self._set_busy(True, "Connecting to Gmail (SMTP)...")
         try:
             client = build_client(credentials)
         except (AuthenticationError, ConfigurationError) as exc:
-            self.status_var.set("")
-            self.connect_btn.configure(state=tk.NORMAL)
+            self._set_busy(False)
             messagebox.showerror("Sign in failed", str(exc), parent=self)
             return
 
-        self.status_var.set("Checking inbox access (IMAP)...")
-        self.update_idletasks()
+        self._set_busy(True, "Checking inbox access (IMAP)...")
         try:
             self.inbox = build_inbox(credentials)
         except (AuthenticationError, ConfigurationError) as exc:
@@ -289,6 +369,128 @@ class FirstMessageDialog(tk.Toplevel):
             return
         self.result = (subject, body)
         self.destroy()
+
+
+BULK_PLACEHOLDER = """Quick follow-up on your Q3 rollout
+Hi there,
+
+I saw the announcement and wanted to reach out.
+
+Best,
+Me
+---
+Question about your hiring plans
+Hi there,
+
+Different message, different subject — same pool.
+
+Best,
+Me"""
+
+
+class BulkImportDialog(tk.Toplevel):
+    """Add many first messages at once: paste them, or load a CSV or a folder."""
+
+    def __init__(self, parent: tk.Misc):
+        super().__init__(parent)
+        self.title("Import first messages")
+        self.geometry("620x520")
+        self.transient(parent)
+        self.result: list[tuple[str, str]] = []
+
+        frame = ttk.Frame(self, padding=14)
+        frame.pack(fill=tk.BOTH, expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(2, weight=1)
+
+        ttk.Label(
+            frame,
+            text=(
+                "Paste your messages below. Separate them with a line of three dashes (---).\n"
+                "In each message the first line is the subject and the rest is the body."
+            ),
+            justify=tk.LEFT,
+        ).grid(row=0, column=0, sticky=tk.W, pady=(0, 8))
+
+        sources = ttk.Frame(frame)
+        sources.grid(row=1, column=0, sticky=tk.EW, pady=(0, 6))
+        ttk.Button(sources, text="Load CSV…", command=self._load_csv).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(sources, text="Load folder…", command=self._load_folder).pack(side=tk.LEFT)
+        ttk.Label(
+            sources,
+            text="CSV needs subject + body columns. A folder takes each .txt/.md file as one message.",
+            font=("Segoe UI", 8), foreground="#888",
+        ).pack(side=tk.LEFT, padx=(10, 0))
+
+        self.text = scrolledtext.ScrolledText(frame, wrap=tk.WORD, font=("Segoe UI", 10), undo=True)
+        self.text.grid(row=2, column=0, sticky=tk.NSEW)
+        self.text.insert("1.0", BULK_PLACEHOLDER)
+        # The sample is a template, not content: the first keystroke replaces it, so a
+        # user can type over it without selecting-all first.
+        self.text.tag_add(tk.SEL, "1.0", tk.END)
+        self.text.bind("<<Modified>>", self._on_modified)
+
+        self.count_var = tk.StringVar(value="")
+        ttk.Label(frame, textvariable=self.count_var, style="Progress.TLabel").grid(
+            row=3, column=0, sticky=tk.W, pady=(6, 0)
+        )
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=4, column=0, sticky=tk.EW, pady=(10, 0))
+        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(buttons, text="Import", command=self._import_text).pack(side=tk.RIGHT)
+
+        self._recount()
+        self.text.focus_set()
+        self.grab_set()
+        self.wait_window()
+
+    def _on_modified(self, _event=None) -> None:
+        # Tk latches this flag and stops reporting until it is cleared.
+        self.text.edit_modified(False)
+        self._recount()
+
+    def _recount(self) -> None:
+        found = len(message_store.parse_bulk_text(self.text.get("1.0", tk.END)))
+        self.count_var.set(f"{found} message{'' if found == 1 else 's'} detected")
+
+    def _accept(self, drafts: list[tuple[str, str]], source: str) -> None:
+        if not drafts:
+            messagebox.showwarning(
+                "Import", f"No usable messages found in {source}.", parent=self
+            )
+            return
+        self.result = drafts
+        self.destroy()
+
+    def _import_text(self) -> None:
+        self._accept(message_store.parse_bulk_text(self.text.get("1.0", tk.END)), "the pasted text")
+
+    def _load_csv(self) -> None:
+        path = filedialog.askopenfilename(
+            parent=self,
+            title="Import messages from CSV",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            drafts = message_store.parse_csv_file(Path(path))
+        except (OSError, UnicodeDecodeError, csv.Error) as exc:
+            messagebox.showerror("Import", f"Could not read the CSV:\n{exc}", parent=self)
+            return
+        self._accept(drafts, Path(path).name)
+
+    def _load_folder(self) -> None:
+        folder = filedialog.askdirectory(parent=self, title="Import messages from a folder")
+        if not folder:
+            return
+        try:
+            drafts = message_store.parse_folder(Path(folder))
+        except OSError as exc:
+            messagebox.showerror("Import", f"Could not read the folder:\n{exc}", parent=self)
+            return
+        self._accept(drafts, Path(folder).name)
 
 
 class GmailAutoSenderApp:
@@ -615,7 +817,7 @@ class GmailAutoSenderApp:
         tree_wrap.columnconfigure(0, weight=1)
         tree_wrap.rowconfigure(0, weight=1)
         self.first_tree = ttk.Treeview(
-            tree_wrap, columns=("subject", "state"), show="headings", selectmode="browse", height=6
+            tree_wrap, columns=("subject", "state"), show="headings", selectmode="extended", height=6
         )
         self.first_tree.heading("subject", text="Subject")
         self.first_tree.heading("state", text="Availability")
@@ -623,16 +825,21 @@ class GmailAutoSenderApp:
         self.first_tree.column("state", width=110, anchor=tk.CENTER, stretch=False)
         self.first_tree.grid(row=0, column=0, sticky=tk.NSEW)
         self.first_tree.bind("<Double-1>", lambda _e: self._edit_first())
+        self.first_tree.bind("<Delete>", lambda _e: self._delete_first())
         scroll = ttk.Scrollbar(tree_wrap, orient=tk.VERTICAL, command=self.first_tree.yview)
         self.first_tree.configure(yscrollcommand=scroll.set)
         scroll.grid(row=0, column=1, sticky=tk.NS)
 
         first_btns = ttk.Frame(first)
         first_btns.grid(row=1, column=0, sticky=tk.EW, pady=(6, 0))
+        self.first_import_btn = ttk.Button(first_btns, text="Import…", command=self._import_first)
+        self.first_import_btn.pack(side=tk.LEFT, padx=(0, 4))
         self.first_new_btn = ttk.Button(first_btns, text="New", command=self._new_first)
         self.first_new_btn.pack(side=tk.LEFT, padx=(0, 4))
         self.first_edit_btn = ttk.Button(first_btns, text="Edit", command=self._edit_first)
         self.first_edit_btn.pack(side=tk.LEFT, padx=(0, 4))
+        self.first_dup_btn = ttk.Button(first_btns, text="Duplicate", command=self._duplicate_first)
+        self.first_dup_btn.pack(side=tk.LEFT, padx=(0, 4))
         self.first_del_btn = ttk.Button(first_btns, text="Delete", command=self._delete_first)
         self.first_del_btn.pack(side=tk.LEFT, padx=(0, 4))
         self.first_reset_btn = ttk.Button(first_btns, text="Clear locks", command=self._reset_locks)
@@ -777,8 +984,7 @@ class GmailAutoSenderApp:
     # -------------------------------------------------- first-message CRUD
 
     def _refresh_first_list(self) -> None:
-        selected = self.first_tree.selection()
-        selected_id = selected[0] if selected else None
+        selected_ids = set(self.first_tree.selection())
         for item in self.first_tree.get_children():
             self.first_tree.delete(item)
         for message in self._store.first_pool:
@@ -786,14 +992,19 @@ class GmailAutoSenderApp:
             state = format_cooldown(message.cooldown_remaining())
             tag = "ready" if message.is_available() else "locked"
             self.first_tree.insert("", tk.END, iid=message.id, values=(preview, state), tags=(tag,))
-        if selected_id and selected_id in self.first_tree.get_children():
-            self.first_tree.selection_set(selected_id)
+        surviving = [i for i in self.first_tree.get_children() if i in selected_ids]
+        if surviving:
+            self.first_tree.selection_set(surviving)
         available = self._store.available_count()
         self.first_count_var.set(f"{len(self._store.first_pool)} messages · {available} ready")
 
     def _selected_first_id(self) -> str | None:
+        """The one selected message, for the actions that only make sense on one."""
         selection = self.first_tree.selection()
         return selection[0] if selection else None
+
+    def _selected_first_ids(self) -> tuple[str, ...]:
+        return self.first_tree.selection()
 
     def _new_first(self) -> None:
         dialog = FirstMessageDialog(self.root, title="New first message")
@@ -802,6 +1013,27 @@ class GmailAutoSenderApp:
             self._store.add_first(subject, body)
             self._refresh_first_list()
             self._append_log(f'Added first message: "{subject[:40]}"', "info")
+
+    def _import_first(self) -> None:
+        dialog = BulkImportDialog(self.root)
+        if not dialog.result:
+            return
+        added = self._store.add_many_first(dialog.result)
+        self._refresh_first_list()
+        self._append_log(f"Imported {added} first message{'' if added == 1 else 's'}.", "success")
+
+    def _duplicate_first(self) -> None:
+        message_id = self._selected_first_id()
+        if not message_id:
+            messagebox.showwarning("Duplicate", "Select a message to duplicate.")
+            return
+        copy = self._store.duplicate_first(message_id)
+        if copy is None:
+            self._refresh_first_list()
+            return
+        self._refresh_first_list()
+        self.first_tree.selection_set(copy.id)
+        self._append_log(f'Duplicated first message: "{copy.subject[:40]}"', "info")
 
     def _edit_first(self) -> None:
         message_id = self._selected_first_id()
@@ -822,17 +1054,23 @@ class GmailAutoSenderApp:
             self._append_log(f'Edited first message: "{subject[:40]}"', "info")
 
     def _delete_first(self) -> None:
-        message_id = self._selected_first_id()
-        if not message_id:
-            messagebox.showwarning("Delete", "Select a message to delete.")
+        message_ids = self._selected_first_ids()
+        if not message_ids:
+            messagebox.showwarning("Delete", "Select one or more messages to delete.")
             return
-        message = self._store.get_first(message_id)
-        label = (message.subject[:40] if message else message_id)
-        if not messagebox.askyesno("Delete", f'Delete first message "{label}"?'):
+
+        if len(message_ids) == 1:
+            message = self._store.get_first(message_ids[0])
+            label = message.subject[:40] if message else message_ids[0]
+            prompt = f'Delete first message "{label}"?'
+        else:
+            prompt = f"Delete {len(message_ids)} first messages?"
+        if not messagebox.askyesno("Delete", prompt):
             return
-        self._store.delete_first(message_id)
+
+        removed = self._store.delete_many_first(message_ids)
         self._refresh_first_list()
-        self._append_log("Deleted a first message.", "info")
+        self._append_log(f"Deleted {removed} first message{'' if removed == 1 else 's'}.", "info")
 
     def _reset_locks(self) -> None:
         if not messagebox.askyesno(
@@ -1037,8 +1275,9 @@ class GmailAutoSenderApp:
 
         editing_buttons = (
             self.import_btn, self.csv_btn, self.delete_btn, self.clear_btn,
-            self.first_new_btn, self.first_edit_btn, self.first_del_btn,
-            self.first_reset_btn, self.second_save_btn, self.second_clear_btn,
+            self.first_import_btn, self.first_new_btn, self.first_edit_btn,
+            self.first_dup_btn, self.first_del_btn, self.first_reset_btn,
+            self.second_save_btn, self.second_clear_btn,
         )
         for button in editing_buttons:
             button.configure(state=tk.NORMAL if idle else tk.DISABLED)

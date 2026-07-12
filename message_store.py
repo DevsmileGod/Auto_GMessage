@@ -8,13 +8,15 @@ The second message is a single body (no subject); it is sent as a threaded reply
 so its subject is derived from the first message ("Re: ...") at send time.
 """
 
+import csv
 import json
 import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 import paths
 
@@ -24,9 +26,91 @@ MESSAGES_PATH = paths.BASE_DIR / "messages.json"
 
 COOLDOWN_SECONDS = 24 * 60 * 60  # a sent first message is locked for 24 hours
 
+# Messages in a pasted block are separated by a line of three or more dashes. A blank
+# line would be the obvious separator but bodies are multi-paragraph, so it would cut
+# them in half; an explicit rule cannot be triggered by ordinary prose.
+BULK_SEPARATOR = re.compile(r"^\s*-{3,}\s*$", re.MULTILINE)
+
+TEXT_SUFFIXES = (".txt", ".md")
+
 
 def _now() -> float:
     return time.time()
+
+
+def _split_subject_body(block: str) -> Optional[tuple[str, str]]:
+    """First non-empty line is the subject, everything after it is the body."""
+    lines = block.strip().splitlines()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    if not lines:
+        return None
+    subject = lines[0].strip()
+    body = "\n".join(lines[1:]).strip()
+    if not subject or not body:
+        return None
+    return subject, body
+
+
+def parse_bulk_text(text: str) -> list[tuple[str, str]]:
+    """Parse pasted text into (subject, body) drafts.
+
+    Messages are separated by a `---` line. Within each, the first line is the subject
+    and the rest is the body. Blocks missing either part are skipped, so a trailing
+    separator or a stray blank block costs nothing.
+    """
+    drafts = []
+    for block in BULK_SEPARATOR.split(text or ""):
+        parsed = _split_subject_body(block)
+        if parsed:
+            drafts.append(parsed)
+    return drafts
+
+
+def parse_csv_file(path: Path) -> list[tuple[str, str]]:
+    """Parse a CSV with `subject` and `body` columns (any column order, any case).
+
+    Falls back to the first two columns if the file has no usable header, which is what
+    a spreadsheet export without a header row looks like.
+    """
+    with path.open(encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.reader(f))
+    if not rows:
+        return []
+
+    header = [(cell or "").strip().lower() for cell in rows[0]]
+    if "subject" in header and "body" in header:
+        subject_at, body_at = header.index("subject"), header.index("body")
+        data_rows = rows[1:]
+    else:
+        subject_at, body_at = 0, 1
+        data_rows = rows
+
+    drafts = []
+    for row in data_rows:
+        if len(row) <= max(subject_at, body_at):
+            continue
+        subject = (row[subject_at] or "").strip()
+        body = (row[body_at] or "").strip()
+        if subject and body:
+            drafts.append((subject, body))
+    return drafts
+
+
+def parse_folder(folder: Path) -> list[tuple[str, str]]:
+    """Parse every .txt/.md file in a folder as one message: first line subject, rest body."""
+    drafts = []
+    for path in sorted(folder.iterdir()):
+        if not path.is_file() or path.suffix.lower() not in TEXT_SUFFIXES:
+            continue
+        try:
+            parsed = _split_subject_body(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError) as exc:
+            logger.warning("Skipped %s: %s", path.name, exc)
+            continue
+        if parsed:
+            drafts.append(parsed)
+    return drafts
 
 
 @dataclass
@@ -120,6 +204,45 @@ class MessageStore:
         self.first_pool.append(message)
         self.save()
         return message
+
+    def add_many_first(self, drafts: Iterable[tuple[str, str]]) -> int:
+        """Append several messages at once. Returns how many were added.
+
+        Blank drafts are dropped rather than added and then reported as unusable.
+        One save() for the whole batch, not one per message.
+        """
+        added = [
+            FirstMessage(subject=subject.strip(), body=body.strip())
+            for subject, body in drafts
+            if subject.strip() and body.strip()
+        ]
+        if not added:
+            return 0
+        self.first_pool.extend(added)
+        self.save()
+        return len(added)
+
+    def duplicate_first(self, message_id: str) -> Optional[FirstMessage]:
+        """Copy a message as a fresh, unlocked pool entry — a base to edit into a variant."""
+        original = self.get_first(message_id)
+        if original is None:
+            return None
+        # A new id and no last_sent_at: the copy is available immediately, and the
+        # original's 24h lock stays with the original.
+        copy = FirstMessage(subject=original.subject, body=original.body)
+        self.first_pool.insert(self.first_pool.index(original) + 1, copy)
+        self.save()
+        return copy
+
+    def delete_many_first(self, message_ids: Iterable[str]) -> int:
+        """Delete several messages at once. Returns how many were removed."""
+        targets = set(message_ids)
+        before = len(self.first_pool)
+        self.first_pool = [m for m in self.first_pool if m.id not in targets]
+        removed = before - len(self.first_pool)
+        if removed:
+            self.save()
+        return removed
 
     def update_first(self, message_id: str, subject: str, body: str) -> bool:
         message = self.get_first(message_id)

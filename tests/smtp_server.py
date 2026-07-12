@@ -55,6 +55,7 @@ class Mailbox:
     emails: list[ReceivedEmail] = field(default_factory=list)
     username: str = "sender@gmail.com"
     password: str = "abcdefghijklmnop"
+    access_token: str = "ya29.test-access-token"
     reject_auth: bool = False
     reject_recipients: set[str] = field(default_factory=set)
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -74,6 +75,32 @@ class _Handler(socketserver.StreamRequestHandler):
     def _read(self) -> str:
         return self.rfile.readline().decode("utf-8", "replace").strip()
 
+    def _check_plain(self, payload: str) -> bool:
+        try:
+            _, user, password = base64.b64decode(payload).decode().split("\0")
+        except (ValueError, UnicodeDecodeError):
+            return False
+        return (
+            not self.mailbox.reject_auth
+            and user == self.mailbox.username
+            and password == self.mailbox.password
+        )
+
+    def _check_xoauth2(self, payload: str) -> bool:
+        """Decode `user=<email>^Aauth=Bearer <token>^A^A`, as Gmail does."""
+        try:
+            decoded = base64.b64decode(payload).decode()
+        except (ValueError, UnicodeDecodeError):
+            return False
+        fields = dict(
+            part.split("=", 1) for part in decoded.split("\x01") if "=" in part
+        )
+        return (
+            not self.mailbox.reject_auth
+            and fields.get("user") == self.mailbox.username
+            and fields.get("auth") == f"Bearer {self.mailbox.access_token}"
+        )
+
     def handle(self) -> None:
         self._send("220 localhost ESMTP test")
         authenticated = False
@@ -89,25 +116,25 @@ class _Handler(socketserver.StreamRequestHandler):
 
             if command in ("EHLO", "HELO"):
                 self._send("250-localhost")
-                self._send("250-AUTH PLAIN")
+                self._send("250-AUTH PLAIN XOAUTH2")
                 self._send("250 HELP")
 
             elif command == "AUTH":
                 mechanism, _, payload = rest.partition(" ")
-                if mechanism.upper() != "PLAIN":
+                mechanism = mechanism.upper()
+                if mechanism == "PLAIN":
+                    accepted = self._check_plain(payload)
+                elif mechanism == "XOAUTH2":
+                    accepted = self._check_xoauth2(payload)
+                else:
                     self._send("504 Unrecognized authentication type")
                     continue
-                decoded = base64.b64decode(payload).decode()
-                _, user, password = decoded.split("\0")
-                if (
-                    self.mailbox.reject_auth
-                    or user != self.mailbox.username
-                    or password != self.mailbox.password
-                ):
-                    self._send("535 5.7.8 Username and Password not accepted")
-                else:
+
+                if accepted:
                     authenticated = True
                     self._send("235 2.7.0 Accepted")
+                else:
+                    self._send("535 5.7.8 Username and Password not accepted")
 
             elif command == "MAIL":
                 if not authenticated:

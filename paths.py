@@ -41,4 +41,7 @@ BASE_DIR = _resolve_base_dir()
 CONFIG_PATH = BASE_DIR / "config.json"
 TEMPLATES_PATH = BASE_DIR / "templates.json"
 CREDENTIALS_PATH = BASE_DIR / "gmail_credentials.json"
+# The OAuth client identity downloaded from the Google Cloud Console. Absent until the
+# user sets one up; the app falls back to App Password sign-in without it.
+OAUTH_CLIENT_PATH = BASE_DIR / "client_secret.json"
 LOG_DIR = BASE_DIR / "logs"
